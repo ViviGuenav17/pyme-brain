@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: pyme-brain
+    runtime: node
+    buildCommand: npm install && npx tsc
+    startCommand: node dist/index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: COUNTRY
+        value: BO
+      - key: CURRENCY
+        value: BOB
+      - key: TIMEZONE
+        value: America/La_Paz
