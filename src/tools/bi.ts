@@ -198,4 +198,76 @@ export function registerBITools(server: McpServer, sheets: SheetsAdapter) {
       });
     }
   );
+  server.tool(
+    'get_overdue_clients',
+    `Lista clientes con mora superior al umbral definido, ordenados por monto descendente.
+    
+    CUÁNDO USAR: El dueño pregunta "¿quiénes me deben más?", "dame la lista de morosos",
+    "¿quién tiene más días sin pagar?".
+    
+    CUÁNDO NO USAR: Si quiere análisis de riesgo completo → usar analyze_cashflow_risk.
+    Si quiere datos de UN cliente → usar get_client_360.
+    
+    DEVUELVE: Lista paginada de clientes morosos con monto, días de mora y datos de contacto.`,
+    {
+      days_threshold: z.number().default(30).describe('Días mínimos de mora. Default: 30'),
+      limit: z.number().max(100).default(20).describe('Máximo de resultados. Default: 20'),
+      offset: z.number().default(0).describe('Para paginación. Default: 0'),
+    },
+    async ({ days_threshold, limit, offset }) => {
+      const correlationId = randomUUID();
+      logger.info('get_overdue_clients iniciado', { correlationId, tool: 'get_overdue_clients' });
+
+      return measureTool('get_overdue_clients', async () => {
+        const [clientes, cobros] = await Promise.all([
+          sheets.getClientes(),
+          sheets.getCobros(),
+        ]);
+
+        const clienteMap = new Map(clientes.map(c => [c.id, c]));
+
+        // Filtrar y ordenar por monto descendente
+        const morosos = cobros
+          .filter(c => c.estado === 'pendiente' && c.dias_mora >= days_threshold)
+          .sort((a, b) => b.monto - a.monto);
+
+        // Paginación — decisión #27
+        const page = morosos.slice(offset, offset + limit);
+        const totalMonto = morosos.reduce((s, c) => s + c.monto, 0);
+
+        const result = {
+          moneda: 'BOB',
+          days_threshold,
+          total: morosos.length,
+          total_monto_bob: totalMonto,
+          limit,
+          offset,
+          has_more: offset + limit < morosos.length,
+          clientes: page.map(c => ({
+            cliente_id: c.cliente_id,
+            nombre: clienteMap.get(c.cliente_id)?.nombre ?? c.cliente_id,
+            telefono: clienteMap.get(c.cliente_id)?.telefono ?? '',
+            ciudad: clienteMap.get(c.cliente_id)?.ciudad ?? '',
+            monto_bob: c.monto,
+            dias_mora: c.dias_mora,
+            fecha_vencimiento: c.fecha_vencimiento,
+            notas: c.notas,
+          })),
+        };
+
+        logger.info('get_overdue_clients completado', {
+          correlationId,
+          tool: 'get_overdue_clients',
+          data: { total: morosos.length, total_monto: totalMonto },
+        });
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(result, null, 2),
+          }],
+        };
+      });
+    }
+  );
 }
