@@ -9,17 +9,8 @@ import { logger } from "./utils/logger.js";
 // Inicializar adaptadores
 const sheets = new SheetsAdapter();
 
-// Servidor MCP
-const server = new McpServer({
-  name: "pyme-brain",
-  version: "1.0.0",
-});
-
-// Registrar tools
-registerBITools(server, sheets);
-
-// Mapa de sesiones activas
-const transports = new Map<string, StreamableHTTPServerTransport>();
+// Mapa de sesiones activas — una por conexión
+const sessions = new Map<string, { server: McpServer; transport: StreamableHTTPServerTransport }>();
 
 // Servidor HTTP
 const httpServer = http.createServer(async (req, res) => {
@@ -38,20 +29,33 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // Endpoint MCP
+  // Endpoint MCP — una instancia de McpServer por sesión
   if (req.url === "/mcp") {
     const sessionId = req.headers["mcp-session-id"] as string ?? randomUUID();
-    let transport = transports.get(sessionId);
+    let session = sessions.get(sessionId);
 
-    if (!transport) {
-      transport = new StreamableHTTPServerTransport({
+    if (!session) {
+      // Crear nuevo servidor MCP para esta sesión
+      const server = new McpServer({
+        name: "pyme-brain",
+        version: "1.0.0",
+      });
+
+      // Registrar tools en esta instancia
+      registerBITools(server, sheets);
+
+      const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => sessionId,
       });
-      transports.set(sessionId, transport);
+
       await server.connect(transport);
+      session = { server, transport };
+      sessions.set(sessionId, session);
+
+      logger.info('Nueva sesión MCP creada', { data: { sessionId } });
     }
 
-    await transport.handleRequest(req, res);
+    await session.transport.handleRequest(req, res);
     return;
   }
 
