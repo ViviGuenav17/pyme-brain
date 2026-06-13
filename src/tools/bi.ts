@@ -270,4 +270,127 @@ export function registerBITools(server: McpServer, sheets: SheetsAdapter) {
       });
     }
   );
+  server.tool(
+    'detect_anomalies',
+    `Detecta patrones inusuales en el negocio — mora inesperada, caída de ventas, stock crítico.
+    
+    CUÁNDO USAR: El dueño pregunta "¿algo raro está pasando?", "¿hay algún problema?",
+    "avísame si algo está mal", o como revisión proactiva matutina del agente.
+    
+    CUÁNDO NO USAR: Si quiere análisis de caja específico → usar analyze_cashflow_risk.
+    
+    DEVUELVE: Lista priorizada de anomalías detectadas con nivel de urgencia y acción recomendada.`,
+    {},
+    async () => {
+      const correlationId = randomUUID();
+      logger.info('detect_anomalies iniciado', { correlationId, tool: 'detect_anomalies' });
+
+      return measureTool('detect_anomalies', async () => {
+        const [clientes, cobros, leads, productos] = await Promise.all([
+          sheets.getClientes(),
+          sheets.getCobros(),
+          sheets.getLeads(),
+          sheets.getProductos(),
+        ]);
+
+        const anomalias: Array<{
+          tipo: string;
+          urgencia: 'CRITICA' | 'ALTA' | 'MEDIA';
+          descripcion: string;
+          accion: string;
+          entidad?: string;
+        }> = [];
+
+        const clienteMap = new Map(clientes.map(c => [c.id, c]));
+
+        // Anomalía 1 — Clientes con mora crítica (>60 días)
+        const moraCritica = cobros.filter(c => c.estado === 'pendiente' && c.dias_mora > 60);
+        moraCritica.forEach(c => {
+          const cliente = clienteMap.get(c.cliente_id);
+          anomalias.push({
+            tipo: 'MORA_CRITICA',
+            urgencia: 'CRITICA',
+            descripcion: `${cliente?.nombre ?? c.cliente_id} tiene ${c.dias_mora} días de mora por Bs. ${c.monto.toLocaleString('es-BO')}`,
+            accion: 'Contactar hoy. Considerar suspender crédito.',
+            entidad: c.cliente_id,
+          });
+        });
+
+        // Anomalía 2 — Productos agotados o bajo punto crítico
+        const productosCriticos = productos.filter(p => p.stock_actual <= p.punto_reorden * 0.5);
+        productosCriticos.forEach(p => {
+          anomalias.push({
+            tipo: 'STOCK_CRITICO',
+            urgencia: p.stock_actual === 0 ? 'CRITICA' : 'ALTA',
+            descripcion: `${p.producto} tiene solo ${p.stock_actual} unidades (punto de reorden: ${p.punto_reorden})`,
+            accion: p.stock_actual === 0
+              ? 'Producto agotado — ordenar reposición urgente.'
+              : 'Stock bajo — generar orden de compra esta semana.',
+            entidad: p.id,
+          });
+        });
+
+        // Anomalía 3 — Leads sin contacto por más de 14 días
+        const hoy = new Date();
+        const leadsFrios = leads.filter(l => {
+          const diasSinContacto = Math.floor(
+            (hoy.getTime() - new Date(l.fecha_ultimo_contacto).getTime()) / (1000 * 60 * 60 * 24)
+          );
+          return diasSinContacto > 14 && l.etapa !== 'ganado' && l.etapa !== 'perdido';
+        });
+
+        if (leadsFrios.length > 0) {
+          anomalias.push({
+            tipo: 'LEADS_FRIOS',
+            urgencia: 'MEDIA',
+            descripcion: `${leadsFrios.length} lead(s) sin contacto por más de 14 días: ${leadsFrios.map(l => l.nombre).join(', ')}`,
+            accion: 'Enviar mensaje de seguimiento esta semana.',
+          });
+        }
+
+        // Anomalía 4 — Clientes con score bajo y crédito alto
+        const clientesRiesgo = clientes.filter(c => c.score_pago < 50 && c.credito_limite > 30000);
+        clientesRiesgo.forEach(c => {
+          anomalias.push({
+            tipo: 'RIESGO_CREDITICIO',
+            urgencia: 'ALTA',
+            descripcion: `${c.nombre} tiene score de pago ${c.score_pago}/100 con límite de crédito Bs. ${c.credito_limite.toLocaleString('es-BO')}`,
+            accion: 'Revisar límite de crédito. Considerar reducción.',
+            entidad: c.id,
+          });
+        });
+
+        // Ordenar por urgencia
+        const orden = { CRITICA: 0, ALTA: 1, MEDIA: 2 };
+        anomalias.sort((a, b) => orden[a.urgencia] - orden[b.urgencia]);
+
+        const result = {
+          fecha: new Date().toISOString().split('T')[0],
+          total_anomalias: anomalias.length,
+          criticas: anomalias.filter(a => a.urgencia === 'CRITICA').length,
+          altas: anomalias.filter(a => a.urgencia === 'ALTA').length,
+          medias: anomalias.filter(a => a.urgencia === 'MEDIA').length,
+          anomalias,
+          estado_general: anomalias.filter(a => a.urgencia === 'CRITICA').length > 0
+            ? '🔴 REQUIERE ATENCIÓN INMEDIATA'
+            : anomalias.filter(a => a.urgencia === 'ALTA').length > 0
+            ? '🟡 HAY SITUACIONES A ATENDER'
+            : '🟢 TODO EN ORDEN',
+        };
+
+        logger.info('detect_anomalies completado', {
+          correlationId,
+          tool: 'detect_anomalies',
+          data: { total: anomalias.length },
+        });
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(result, null, 2),
+          }],
+        };
+      });
+    }
+  );
 }
