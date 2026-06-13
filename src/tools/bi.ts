@@ -393,4 +393,80 @@ export function registerBITools(server: McpServer, sheets: SheetsAdapter) {
       });
     }
   );
+  server.tool(
+    'get_best_clients',
+    `Rankea los mejores clientes según el criterio elegido.
+    
+    CUÁNDO USAR: El dueño pregunta "¿quiénes son mis mejores clientes?", 
+    "¿a quién le doy más crédito?", "¿quién me compra más?", "¿quién siempre paga puntual?".
+    
+    DEVUELVE: Lista rankeada de clientes por volumen de compra, puntualidad de pago o score compuesto.`,
+    {
+      metric: z.enum(['monto', 'score_pago', 'compuesto']).default('compuesto').describe(
+        'Criterio de ranking: monto (mayor comprador), score_pago (más puntual), compuesto (ambos). Default: compuesto'
+      ),
+      limit: z.number().max(20).default(5).describe('Cantidad de clientes a mostrar. Default: 5'),
+    },
+    async ({ metric, limit }) => {
+      const correlationId = randomUUID();
+      logger.info('get_best_clients iniciado', { correlationId, tool: 'get_best_clients' });
+
+      return measureTool('get_best_clients', async () => {
+        const [clientes, cobros] = await Promise.all([
+          sheets.getClientes(),
+          sheets.getCobros(),
+        ]);
+
+        // Calcular monto total por cliente
+        const montoPorCliente = cobros.reduce((acc, c) => {
+          acc[c.cliente_id] = (acc[c.cliente_id] || 0) + c.monto;
+          return acc;
+        }, {} as Record<string, number>);
+
+        // Construir ranking
+        const ranking = clientes.map(c => ({
+          cliente_id: c.id,
+          nombre: c.nombre,
+          ciudad: c.ciudad,
+          tipo_cliente: c.tipo_cliente,
+          score_pago: c.score_pago,
+          monto_total_bob: montoPorCliente[c.id] || 0,
+          score_compuesto: Math.round(
+            (c.score_pago * 0.5) + ((montoPorCliente[c.id] || 0) / 1000 * 0.5)
+          ),
+        }));
+
+        // Ordenar según métrica
+        ranking.sort((a, b) => {
+          if (metric === 'monto') return b.monto_total_bob - a.monto_total_bob;
+          if (metric === 'score_pago') return b.score_pago - a.score_pago;
+          return b.score_compuesto - a.score_compuesto;
+        });
+
+        const top = ranking.slice(0, limit);
+
+        const result = {
+          moneda: 'BOB',
+          metric,
+          total_clientes: clientes.length,
+          top_clientes: top,
+          recomendacion: `Los ${top.length} mejores clientes por ${metric}. ` +
+            `Priorizar atención y crédito a: ${top.slice(0, 3).map(c => c.nombre).join(', ')}.`,
+        };
+
+        logger.info('get_best_clients completado', {
+          correlationId,
+          tool: 'get_best_clients',
+          data: { metric, total: clientes.length },
+        });
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(result, null, 2),
+          }],
+        };
+      });
+    }
+  );
 }
