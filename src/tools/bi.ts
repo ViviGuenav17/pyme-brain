@@ -103,4 +103,99 @@ export function registerBITools(server: McpServer, sheets: SheetsAdapter) {
       });
     }
   );
+  server.tool(
+    'analyze_cashflow_risk',
+    `Analiza el riesgo de flujo de caja para los próximos N días.
+    
+    CUÁNDO USAR: El dueño pregunta "¿cómo está mi caja?", "¿quién me debe?",
+    "¿voy a tener problemas de liquidez?", "muéstrame los morosos".
+    
+    CUÁNDO NO USAR: Si pregunta por UN cliente específico → usar get_client_360.
+    Si pregunta por predicción futura → usar forecast_cashflow.
+    
+    DEVUELVE: Clientes en tres segmentos: critico (mora >60d), alerta (mora >30d),
+    ok. Monto total en riesgo en BOB. Días promedio de mora por segmento.`,
+    {
+      horizon_days: z.number().min(1).max(365).default(30).describe(
+        'Días hacia adelante para analizar. Default: 30'
+      ),
+    },
+    async ({ horizon_days }) => {
+      const correlationId = randomUUID();
+      logger.info('analyze_cashflow_risk iniciado', { correlationId, tool: 'analyze_cashflow_risk' });
+
+      return measureTool('analyze_cashflow_risk', async () => {
+        const [clientes, cobros] = await Promise.all([
+          sheets.getClientes(),
+          sheets.getCobros(),
+        ]);
+
+        const clienteMap = new Map(clientes.map(c => [c.id, c]));
+        const pendientes = cobros.filter(c => c.estado === 'pendiente');
+
+        // Segmentar por nivel de mora
+        const criticos = pendientes.filter(c => c.dias_mora > 60);
+        const alerta = pendientes.filter(c => c.dias_mora > 30 && c.dias_mora <= 60);
+        const ok = pendientes.filter(c => c.dias_mora <= 30);
+
+        const formatSegmento = (cobros: typeof pendientes) =>
+          cobros.map(c => ({
+            cliente: clienteMap.get(c.cliente_id)?.nombre ?? c.cliente_id,
+            telefono: clienteMap.get(c.cliente_id)?.telefono ?? '',
+            ciudad: clienteMap.get(c.cliente_id)?.ciudad ?? '',
+            monto_bob: c.monto,
+            dias_mora: c.dias_mora,
+            notas: c.notas,
+          }));
+
+        const totalEnRiesgo = [...criticos, ...alerta].reduce((s, c) => s + c.monto, 0);
+
+        const result = {
+          moneda: 'BOB',
+          horizon_days,
+          resumen: {
+            total_en_riesgo_bob: totalEnRiesgo,
+            criticos: criticos.length,
+            en_alerta: alerta.length,
+            al_dia: ok.length,
+          },
+          segmentos: {
+            critico: {
+              descripcion: 'Mora mayor a 60 días — acción inmediata',
+              clientes: formatSegmento(criticos),
+              total_bob: criticos.reduce((s, c) => s + c.monto, 0),
+            },
+            alerta: {
+              descripcion: 'Mora entre 30 y 60 días — seguimiento urgente',
+              clientes: formatSegmento(alerta),
+              total_bob: alerta.reduce((s, c) => s + c.monto, 0),
+            },
+            ok: {
+              descripcion: 'Al día o mora menor a 30 días',
+              clientes: formatSegmento(ok),
+              total_bob: ok.reduce((s, c) => s + c.monto, 0),
+            },
+          },
+          recomendacion: criticos.length > 0
+            ? `⚠️ Hay ${criticos.length} cliente(s) en estado crítico. Iniciar campaña de cobranza inmediata.`
+            : alerta.length > 0
+            ? `📋 Hay ${alerta.length} cliente(s) en alerta. Contactar esta semana.`
+            : '✅ Flujo de caja en buen estado.',
+        };
+
+        logger.info('analyze_cashflow_risk completado', {
+          correlationId,
+          tool: 'analyze_cashflow_risk',
+          data: { total_en_riesgo: totalEnRiesgo },
+        });
+
+        return {
+          content: [{
+            type: 'text' as const,
+            text: JSON.stringify(result, null, 2),
+          }],
+        };
+      });
+    }
+  );
 }
