@@ -4,6 +4,7 @@ import { randomUUID } from "crypto";
 import http from "http";
 import { SheetsAdapter } from "./adapters/sheets.adapter.js";
 import { registerBITools } from "./tools/bi.js";
+import { registerCobrosTools } from "./tools/cobros.js";
 import { logger } from "./utils/logger.js";
 
 // Inicializar adaptadores
@@ -43,6 +44,7 @@ const httpServer = http.createServer(async (req, res) => {
 
       // Registrar tools en esta instancia
       registerBITools(server, sheets);
+      registerCobrosTools(server, sheets);
 
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => sessionId,
