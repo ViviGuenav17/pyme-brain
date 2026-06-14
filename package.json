@@ -16,9 +16,13 @@
   "license": "ISC",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@types/express": "^5.0.6",
     "@types/node": "^25.9.3",
+    "@types/pg": "^8.20.0",
     "dotenv": "^17.4.2",
+    "express": "^5.2.1",
     "googleapis": "^173.0.0",
+    "pg": "^8.21.0",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",
     "zod": "^4.4.3"
