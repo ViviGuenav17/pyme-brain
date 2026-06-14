@@ -1,14 +1,14 @@
 // SheetsAdapter — conecta con Google Sheets usando OAuth 2.1
-// Es la única capa que habla directamente con la API de Google
-// Todas las tools leen y escriben datos a través de este adaptador
+// Soporta configuración dinámica multi-empresa
+// Lee la estructura del Sheet desde las pestañas Empresa y Config
 
 import { google } from 'googleapis';
 import { CircuitBreaker } from '../infra/circuit-breaker.js';
 import { withRetry } from '../utils/retry.js';
 import { logger } from '../utils/logger.js';
 import { cache } from '../infra/cache.js';
+import { empresaConfigLoader, SheetConfig, EmpresaConfig } from '../config/empresa.config.js';
 
-// Tipos de datos del negocio
 export interface Cliente {
   id: string;
   nombre: string;
@@ -53,6 +53,10 @@ export interface Producto {
   punto_reorden: number;
   costo_unitario: number;
   precio_venta: number;
+  fecha_vencimiento?: string;
+  lote?: string;
+  almacen?: string;
+  proveedor_id?: string;
 }
 
 export interface LogEntry {
@@ -68,6 +72,7 @@ export interface LogEntry {
 export class SheetsAdapter {
   private breaker = new CircuitBreaker('GoogleSheets');
   private sheets;
+  private sheetConfig: SheetConfig | null = null;
 
   constructor() {
     const auth = new google.auth.OAuth2(
@@ -85,7 +90,7 @@ export class SheetsAdapter {
   }
 
   // Lee una pestaña completa del Sheet
-  private async readTab(tabName: string): Promise<string[][]> {
+  async readTab(tabName: string): Promise<string[][]> {
     const cacheKey = `sheet:${tabName}`;
     const cached = cache.get<string[][]>(cacheKey);
     if (cached) return cached;
@@ -104,55 +109,91 @@ export class SheetsAdapter {
     return rows;
   }
 
-  // Obtiene todos los clientes
+  // Inicializa la configuración dinámica de la empresa
+  async initialize(): Promise<void> {
+    this.sheetConfig = await empresaConfigLoader.load({
+      readTab: (tab) => this.readTab(tab),
+    });
+  }
+
+  // Devuelve la configuración de la empresa
+  getEmpresaConfig(): EmpresaConfig | null {
+    return this.sheetConfig?.empresa ?? null;
+  }
+
+  // Helper para obtener valor usando mapeo dinámico
+  private getValue(pestana: string, campo: string, row: string[]): string {
+    if (!this.sheetConfig) return '';
+    return empresaConfigLoader.getValue(this.sheetConfig, pestana, campo, row);
+  }
+
+  // Obtiene todos los clientes usando mapeo dinámico
   async getClientes(): Promise<Cliente[]> {
     const rows = await this.readTab('Clientes');
-    return rows.slice(1).map(r => ({
-      id: r[0], nombre: r[1], telefono: r[2], email: r[3],
-      credito_limite: parseFloat(r[4]) || 0,
-      score_pago: parseFloat(r[5]) || 0,
-      fecha_ultimo_contacto: r[6], nit: r[7], ci: r[8],
-      tipo_cliente: r[9], ciudad: r[10],
+    return rows.slice(1).filter(r => r[0]).map(r => ({
+      id: this.getValue('Clientes', 'cliente_id', r),
+      nombre: this.getValue('Clientes', 'cliente_nombre', r),
+      telefono: this.getValue('Clientes', 'cliente_telefono', r),
+      email: this.getValue('Clientes', 'cliente_email', r),
+      credito_limite: parseFloat(this.getValue('Clientes', 'cliente_credito_limite', r)) || 0,
+      score_pago: parseFloat(this.getValue('Clientes', 'cliente_score_pago', r)) || 0,
+      fecha_ultimo_contacto: this.getValue('Clientes', 'cliente_fecha_ultimo_contacto', r),
+      nit: this.getValue('Clientes', 'cliente_nit', r),
+      ci: this.getValue('Clientes', 'cliente_ci', r),
+      tipo_cliente: this.getValue('Clientes', 'cliente_tipo', r),
+      ciudad: this.getValue('Clientes', 'cliente_ciudad', r),
     }));
   }
 
-  // Obtiene todos los cobros
+  // Obtiene todos los cobros usando mapeo dinámico
   async getCobros(): Promise<Cobro[]> {
     const rows = await this.readTab('Cobros');
-    return rows.slice(1).map(r => ({
-      id: r[0], cliente_id: r[1],
-      monto: parseFloat(r[2]) || 0,
-      fecha_vencimiento: r[3], estado: r[4],
-      fecha_pago: r[5],
-      dias_mora: parseInt(r[6]) || 0,
-      notas: r[7],
+    return rows.slice(1).filter(r => r[0]).map(r => ({
+      id: this.getValue('Cobros', 'cobro_id', r),
+      cliente_id: this.getValue('Cobros', 'cobro_cliente_id', r),
+      monto: parseFloat(this.getValue('Cobros', 'cobro_monto', r)) || 0,
+      fecha_vencimiento: this.getValue('Cobros', 'cobro_fecha_vencimiento', r),
+      estado: this.getValue('Cobros', 'cobro_estado', r),
+      fecha_pago: this.getValue('Cobros', 'cobro_fecha_pago', r),
+      dias_mora: parseInt(this.getValue('Cobros', 'cobro_dias_mora', r)) || 0,
+      notas: this.getValue('Cobros', 'cobro_notas', r),
     }));
   }
 
-  // Obtiene todos los leads
+  // Obtiene todos los leads usando mapeo dinámico
   async getLeads(): Promise<Lead[]> {
     const rows = await this.readTab('Leads');
-    return rows.slice(1).map(r => ({
-      id: r[0], nombre: r[1], telefono: r[2],
-      canal_origen: r[3], producto_interes: r[4],
-      etapa: r[5], score: parseInt(r[6]) || 0,
-      fecha_ultimo_contacto: r[7],
+    return rows.slice(1).filter(r => r[0]).map(r => ({
+      id: this.getValue('Leads', 'lead_id', r),
+      nombre: this.getValue('Leads', 'lead_nombre', r),
+      telefono: this.getValue('Leads', 'lead_telefono', r),
+      canal_origen: this.getValue('Leads', 'lead_canal', r),
+      producto_interes: this.getValue('Leads', 'lead_producto', r),
+      etapa: this.getValue('Leads', 'lead_etapa', r),
+      score: parseInt(this.getValue('Leads', 'lead_score', r)) || 0,
+      fecha_ultimo_contacto: this.getValue('Leads', 'lead_fecha_contacto', r),
     }));
   }
 
-  // Obtiene todos los productos
+  // Obtiene todos los productos usando mapeo dinámico
   async getProductos(): Promise<Producto[]> {
     const rows = await this.readTab('Inventario');
-    return rows.slice(1).map(r => ({
-      id: r[0], producto: r[1], sku: r[2],
-      stock_actual: parseInt(r[3]) || 0,
-      punto_reorden: parseInt(r[4]) || 0,
-      costo_unitario: parseFloat(r[5]) || 0,
-      precio_venta: parseFloat(r[6]) || 0,
+    return rows.slice(1).filter(r => r[0]).map(r => ({
+      id: this.getValue('Inventario', 'producto_id', r),
+      producto: this.getValue('Inventario', 'producto_nombre', r),
+      sku: this.getValue('Inventario', 'producto_sku', r),
+      stock_actual: parseInt(this.getValue('Inventario', 'producto_stock', r)) || 0,
+      punto_reorden: parseInt(this.getValue('Inventario', 'producto_reorden', r)) || 0,
+      costo_unitario: parseFloat(this.getValue('Inventario', 'producto_costo', r)) || 0,
+      precio_venta: parseFloat(this.getValue('Inventario', 'producto_precio', r)) || 0,
+      fecha_vencimiento: this.getValue('Inventario', 'producto_vencimiento', r),
+      lote: this.getValue('Inventario', 'producto_lote', r),
+      almacen: this.getValue('Inventario', 'producto_almacen', r),
+      proveedor_id: this.getValue('Inventario', 'producto_proveedor', r),
     }));
   }
 
-  // Registra una acción en el Log_Acciones (append-only)
+  // Registra una acción en el Log_Acciones — append only
   async appendLog(entry: LogEntry): Promise<void> {
     await this.breaker.call(() =>
       withRetry(() =>
@@ -162,8 +203,12 @@ export class SheetsAdapter {
           valueInputOption: 'RAW',
           requestBody: {
             values: [[
-              entry.timestamp, entry.tool_name, entry.correlation_id,
-              entry.cliente_id, entry.accion, entry.resultado,
+              entry.timestamp,
+              entry.tool_name,
+              entry.correlation_id,
+              entry.cliente_id,
+              entry.accion,
+              entry.resultado,
               entry.dry_run.toString(),
             ]],
           },
@@ -171,6 +216,9 @@ export class SheetsAdapter {
       )
     );
     cache.invalidatePattern('sheet:');
-    logger.info('Log registrado', { tool: entry.tool_name, correlationId: entry.correlation_id });
+    logger.info('Log registrado', {
+      tool: entry.tool_name,
+      correlationId: entry.correlation_id,
+    });
   }
 }
