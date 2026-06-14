@@ -1,7 +1,3 @@
-// DocsAdapter — conecta con Google Docs usando OAuth 2.1
-// Genera documentos formales — contratos, cotizaciones, órdenes de compra
-// Usa los mismos tokens OAuth que SheetsAdapter
-
 import { google } from 'googleapis';
 import { CircuitBreaker } from '../infra/circuit-breaker.js';
 import { withRetry } from '../utils/retry.js';
@@ -18,21 +14,20 @@ export class DocsAdapter {
   private docs;
   private drive;
 
-  constructor() {
-    const auth = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET,
-    );
-    auth.setCredentials({
-      refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-    });
-    this.docs = google.docs({ version: 'v1', auth });
-    this.drive = google.drive({ version: 'v3', auth });
+  constructor(auth?: any) {
+    const authClient = auth ?? (() => {
+      const a = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+      );
+      a.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+      return a;
+    })();
+    this.docs = google.docs({ version: 'v1', auth: authClient });
+    this.drive = google.drive({ version: 'v3', auth: authClient });
   }
 
-  // Crea un documento nuevo con contenido
   async createDoc(title: string, content: string): Promise<DocInfo> {
-    // 1. Crear documento vacío
     const doc = await this.breaker.call(() =>
       withRetry(() =>
         this.docs.documents.create({
@@ -43,7 +38,6 @@ export class DocsAdapter {
 
     const docId = doc.data.documentId!;
 
-    // 2. Insertar contenido
     await this.breaker.call(() =>
       withRetry(() =>
         this.docs.documents.batchUpdate({
@@ -69,7 +63,6 @@ export class DocsAdapter {
     };
   }
 
-  // Genera documento de cotización formal
   async createCotizacionDoc(
     cotizacion_id: string,
     empresa: string,
@@ -104,7 +97,6 @@ ${empresa}`;
     return this.createDoc(`Cotización ${cotizacion_id} — ${cliente}`, content);
   }
 
-  // Genera documento de orden de compra formal
   async createOrdenCompraDoc(
     orden_id: string,
     empresa: string,

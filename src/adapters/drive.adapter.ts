@@ -1,7 +1,3 @@
-// DriveAdapter — conecta con Google Drive usando OAuth 2.1
-// Guarda PDFs de cotizaciones, órdenes de compra y documentos del negocio
-// Usa los mismos tokens OAuth que SheetsAdapter
-
 import { google } from 'googleapis';
 import { CircuitBreaker } from '../infra/circuit-breaker.js';
 import { withRetry } from '../utils/retry.js';
@@ -22,18 +18,18 @@ export class DriveAdapter {
   private breaker = new CircuitBreaker('GoogleDrive');
   private drive;
 
-  constructor() {
-    const auth = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET,
-    );
-    auth.setCredentials({
-      refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-    });
-    this.drive = google.drive({ version: 'v3', auth });
+  constructor(auth?: any) {
+    const authClient = auth ?? (() => {
+      const a = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+      );
+      a.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+      return a;
+    })();
+    this.drive = google.drive({ version: 'v3', auth: authClient });
   }
 
-  // Lista archivos del Drive
   async listFiles(query?: string, maxResults = 10): Promise<DriveFile[]> {
     const cacheKey = `drive:list:${query}:${maxResults}`;
     const cached = cache.get<DriveFile[]>(cacheKey);
@@ -64,7 +60,6 @@ export class DriveAdapter {
     return files;
   }
 
-  // Crea un archivo de texto en Drive
   async createTextFile(name: string, content: string, folderId?: string): Promise<DriveFile> {
     const result = await this.breaker.call(() =>
       withRetry(() =>
@@ -95,24 +90,15 @@ export class DriveAdapter {
     };
   }
 
-  // Busca archivos por nombre
   async searchFiles(name: string): Promise<DriveFile[]> {
     return this.listFiles(`name contains '${name}' and trashed=false`);
   }
 
-  // Guarda una cotización en Drive
   async saveCotizacion(cotizacion_id: string, contenido: string): Promise<DriveFile> {
-    return this.createTextFile(
-      `Cotización ${cotizacion_id}.txt`,
-      contenido,
-    );
+    return this.createTextFile(`Cotización ${cotizacion_id}.txt`, contenido);
   }
 
-  // Guarda una orden de compra en Drive
   async saveOrdenCompra(orden_id: string, contenido: string): Promise<DriveFile> {
-    return this.createTextFile(
-      `Orden de Compra ${orden_id}.txt`,
-      contenido,
-    );
+    return this.createTextFile(`Orden de Compra ${orden_id}.txt`, contenido);
   }
 }

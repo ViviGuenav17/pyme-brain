@@ -1,7 +1,3 @@
-// SheetsAdapter — conecta con Google Sheets usando OAuth 2.1
-// Soporta configuración dinámica multi-empresa
-// Lee la estructura del Sheet desde las pestañas Empresa y Config
-
 import { google } from 'googleapis';
 import { CircuitBreaker } from '../infra/circuit-breaker.js';
 import { withRetry } from '../utils/retry.js';
@@ -73,25 +69,30 @@ export class SheetsAdapter {
   private breaker = new CircuitBreaker('GoogleSheets');
   private sheets;
   private sheetConfig: SheetConfig | null = null;
+  private _sheetId: string;
 
-  constructor() {
-    const auth = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET,
-    );
-    auth.setCredentials({
-      refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-    });
-    this.sheets = google.sheets({ version: 'v4', auth });
+  constructor(auth?: any, sheetId?: string) {
+    // Si se pasan credenciales externas (multi-tenant) las usa
+    // Si no, usa las del .env (modo demo/fallback)
+    const authClient = auth ?? (() => {
+      const a = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+      );
+      a.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+      return a;
+    })();
+
+    this._sheetId = sheetId ?? process.env.SHEET_ID!;
+    this.sheets = google.sheets({ version: 'v4', auth: authClient });
   }
 
   private get sheetId() {
-    return process.env.SHEET_ID!;
+    return this._sheetId;
   }
 
-  // Lee una pestaña completa del Sheet
   async readTab(tabName: string): Promise<string[][]> {
-    const cacheKey = `sheet:${tabName}`;
+    const cacheKey = `sheet:${this._sheetId}:${tabName}`;
     const cached = cache.get<string[][]>(cacheKey);
     if (cached) return cached;
 
@@ -109,25 +110,21 @@ export class SheetsAdapter {
     return rows;
   }
 
-  // Inicializa la configuración dinámica de la empresa
   async initialize(): Promise<void> {
     this.sheetConfig = await empresaConfigLoader.load({
       readTab: (tab) => this.readTab(tab),
     });
   }
 
-  // Devuelve la configuración de la empresa
   getEmpresaConfig(): EmpresaConfig | null {
     return this.sheetConfig?.empresa ?? null;
   }
 
-  // Helper para obtener valor usando mapeo dinámico
   private getValue(pestana: string, campo: string, row: string[]): string {
     if (!this.sheetConfig) return '';
     return empresaConfigLoader.getValue(this.sheetConfig, pestana, campo, row);
   }
 
-  // Obtiene todos los clientes usando mapeo dinámico
   async getClientes(): Promise<Cliente[]> {
     const rows = await this.readTab('Clientes');
     return rows.slice(1).filter(r => r[0]).map(r => ({
@@ -145,7 +142,6 @@ export class SheetsAdapter {
     }));
   }
 
-  // Obtiene todos los cobros usando mapeo dinámico
   async getCobros(): Promise<Cobro[]> {
     const rows = await this.readTab('Cobros');
     return rows.slice(1).filter(r => r[0]).map(r => ({
@@ -160,7 +156,6 @@ export class SheetsAdapter {
     }));
   }
 
-  // Obtiene todos los leads usando mapeo dinámico
   async getLeads(): Promise<Lead[]> {
     const rows = await this.readTab('Leads');
     return rows.slice(1).filter(r => r[0]).map(r => ({
@@ -175,7 +170,6 @@ export class SheetsAdapter {
     }));
   }
 
-  // Obtiene todos los productos usando mapeo dinámico
   async getProductos(): Promise<Producto[]> {
     const rows = await this.readTab('Inventario');
     return rows.slice(1).filter(r => r[0]).map(r => ({
@@ -193,7 +187,6 @@ export class SheetsAdapter {
     }));
   }
 
-  // Registra una acción en el Log_Acciones — append only
   async appendLog(entry: LogEntry): Promise<void> {
     await this.breaker.call(() =>
       withRetry(() =>
@@ -215,7 +208,7 @@ export class SheetsAdapter {
         })
       )
     );
-    cache.invalidatePattern('sheet:');
+    cache.invalidatePattern(`sheet:${this._sheetId}:`);
     logger.info('Log registrado', {
       tool: entry.tool_name,
       correlationId: entry.correlation_id,

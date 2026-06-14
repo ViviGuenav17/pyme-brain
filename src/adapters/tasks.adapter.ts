@@ -1,7 +1,3 @@
-// TasksAdapter — conecta con Google Tasks usando OAuth 2.1
-// Crea y gestiona tareas para empleados y vendedores
-// Usa los mismos tokens OAuth que SheetsAdapter
-
 import { google } from 'googleapis';
 import { CircuitBreaker } from '../infra/circuit-breaker.js';
 import { withRetry } from '../utils/retry.js';
@@ -26,18 +22,18 @@ export class TasksAdapter {
   private breaker = new CircuitBreaker('GoogleTasks');
   private tasks;
 
-  constructor() {
-    const auth = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET,
-    );
-    auth.setCredentials({
-      refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-    });
-    this.tasks = google.tasks({ version: 'v1', auth });
+  constructor(auth?: any) {
+    const authClient = auth ?? (() => {
+      const a = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+      );
+      a.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+      return a;
+    })();
+    this.tasks = google.tasks({ version: 'v1', auth: authClient });
   }
 
-  // Lista todas las listas de tareas
   async getTaskLists(): Promise<TaskList[]> {
     const cacheKey = 'tasks:lists';
     const cached = cache.get<TaskList[]>(cacheKey);
@@ -56,7 +52,6 @@ export class TasksAdapter {
     return lists;
   }
 
-  // Lista tareas pendientes de una lista
   async getTasks(taskListId = '@default', maxResults = 20): Promise<Task[]> {
     const cacheKey = `tasks:list:${taskListId}`;
     const cached = cache.get<Task[]>(cacheKey);
@@ -85,7 +80,6 @@ export class TasksAdapter {
     return tasks;
   }
 
-  // Crea una tarea nueva
   async createTask(
     title: string,
     notes?: string,
@@ -117,7 +111,6 @@ export class TasksAdapter {
     };
   }
 
-  // Marca una tarea como completada
   async completeTask(taskId: string, taskListId = '@default'): Promise<void> {
     await this.breaker.call(() =>
       withRetry(() =>
@@ -133,7 +126,6 @@ export class TasksAdapter {
     logger.info('Tarea completada', { data: { taskId } });
   }
 
-  // Crea tarea de cobro para un vendedor
   async createCobroTask(
     clienteNombre: string,
     monto: number,
@@ -147,7 +139,6 @@ export class TasksAdapter {
     );
   }
 
-  // Crea tarea de seguimiento de lead
   async createLeadTask(
     leadNombre: string,
     productoInteres: string,

@@ -20,9 +20,11 @@ import { registerGoogleTools } from "./tools/google.js";
 import { logger } from "./utils/logger.js";
 import { initDB, upsertEmpresa } from "./auth/db.js";
 import { getAuthUrl, exchangeCodeForTokens, getUserInfo } from "./auth/oauth.js";
+import { getAdaptersForEmpresa } from "./auth/tenant.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Adaptadores demo — usados cuando no hay empresa_id
 const sheets = new SheetsAdapter();
 const gmail = new GmailAdapter();
 const drive = new DriveAdapter();
@@ -176,11 +178,39 @@ const httpServer = http.createServer(async (req, res) => {
     if (!session) {
       const server = new McpServer({ name: 'pyme-brain', version: '1.0.0' });
 
-      registerBITools(server, sheets);
-      registerCobrosTools(server, sheets);
-      registerInventarioTools(server, sheets);
-      registerVentasTools(server, sheets);
-      registerGoogleTools(server, gmail, drive, calendar, tasks, docs);
+      // Resolver adapters — usa empresa_id si viene en header, sino usa demo
+      const empresaId = req.headers['x-empresa-id'] as string | undefined;
+      let activeSheets = sheets;
+      let activeGmail = gmail;
+      let activeDrive = drive;
+      let activeCalendar = calendar;
+      let activeTasks = tasks;
+      let activeDocs = docs;
+
+      if (empresaId) {
+        try {
+          const tenant = await getAdaptersForEmpresa(empresaId);
+          activeSheets = tenant.sheets;
+          activeGmail = tenant.gmail;
+          activeDrive = tenant.drive;
+          activeCalendar = tenant.calendar;
+          activeTasks = tenant.tasks;
+          activeDocs = tenant.docs;
+          logger.info('Sesión MCP multi-tenant', {
+            data: { sessionId, empresa_id: empresaId, nombre: tenant.empresa_nombre }
+          });
+        } catch (err) {
+          logger.warn('empresa_id inválido, usando demo', {
+            data: { empresaId, error: String(err) }
+          });
+        }
+      }
+
+      registerBITools(server, activeSheets);
+      registerCobrosTools(server, activeSheets);
+      registerInventarioTools(server, activeSheets);
+      registerVentasTools(server, activeSheets);
+      registerGoogleTools(server, activeGmail, activeDrive, activeCalendar, activeTasks, activeDocs);
 
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => sessionId,
@@ -190,7 +220,9 @@ const httpServer = http.createServer(async (req, res) => {
       session = { server, transport };
       sessions.set(sessionId, session);
 
-      logger.info('Nueva sesión MCP creada', { data: { sessionId } });
+      logger.info('Nueva sesión MCP creada', {
+        data: { sessionId, empresaId: empresaId ?? 'demo' }
+      });
     }
 
     await session.transport.handleRequest(req, res);

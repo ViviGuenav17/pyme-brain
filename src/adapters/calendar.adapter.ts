@@ -1,7 +1,3 @@
-// CalendarAdapter — conecta con Google Calendar usando OAuth 2.1
-// Agenda recordatorios de cobro, seguimientos de leads y entregas
-// Usa los mismos tokens OAuth que SheetsAdapter
-
 import { google } from 'googleapis';
 import { CircuitBreaker } from '../infra/circuit-breaker.js';
 import { withRetry } from '../utils/retry.js';
@@ -22,18 +18,18 @@ export class CalendarAdapter {
   private breaker = new CircuitBreaker('GoogleCalendar');
   private calendar;
 
-  constructor() {
-    const auth = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET,
-    );
-    auth.setCredentials({
-      refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-    });
-    this.calendar = google.calendar({ version: 'v3', auth });
+  constructor(auth?: any) {
+    const authClient = auth ?? (() => {
+      const a = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+      );
+      a.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+      return a;
+    })();
+    this.calendar = google.calendar({ version: 'v3', auth: authClient });
   }
 
-  // Lista eventos próximos
   async getUpcomingEvents(days = 7, maxResults = 10): Promise<CalendarEvent[]> {
     const cacheKey = `calendar:upcoming:${days}:${maxResults}`;
     const cached = cache.get<CalendarEvent[]>(cacheKey);
@@ -69,7 +65,6 @@ export class CalendarAdapter {
     return events;
   }
 
-  // Crea un evento en el calendario
   async createEvent(
     title: string,
     description: string,
@@ -105,37 +100,29 @@ export class CalendarAdapter {
     };
   }
 
-  // Crea recordatorio de cobro
   async createCobroReminder(
     clienteNombre: string,
     monto: number,
     fecha: string,
   ): Promise<CalendarEvent> {
-    const startDateTime = `${fecha}T09:00:00`;
-    const endDateTime = `${fecha}T09:30:00`;
-
     return this.createEvent(
       `💰 Cobrar a ${clienteNombre} — Bs. ${monto.toLocaleString('es-BO')}`,
       `Recordatorio de cobro:\nCliente: ${clienteNombre}\nMonto: Bs. ${monto.toLocaleString('es-BO')}\nFecha límite: ${fecha}`,
-      startDateTime,
-      endDateTime,
+      `${fecha}T09:00:00`,
+      `${fecha}T09:30:00`,
     );
   }
 
-  // Crea recordatorio de seguimiento de lead
   async createLeadFollowup(
     leadNombre: string,
     productoInteres: string,
     fecha: string,
   ): Promise<CalendarEvent> {
-    const startDateTime = `${fecha}T10:00:00`;
-    const endDateTime = `${fecha}T10:30:00`;
-
     return this.createEvent(
       `📞 Seguimiento lead: ${leadNombre}`,
       `Hacer seguimiento a ${leadNombre}\nProducto de interés: ${productoInteres}`,
-      startDateTime,
-      endDateTime,
+      `${fecha}T10:00:00`,
+      `${fecha}T10:30:00`,
     );
   }
 }

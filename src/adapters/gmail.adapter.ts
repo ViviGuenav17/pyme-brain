@@ -1,7 +1,3 @@
-// GmailAdapter — conecta con Gmail usando OAuth 2.1
-// Lee inbox, busca facturas de proveedores y envía emails
-// Usa los mismos tokens OAuth que SheetsAdapter
-
 import { google } from 'googleapis';
 import { CircuitBreaker } from '../infra/circuit-breaker.js';
 import { withRetry } from '../utils/retry.js';
@@ -22,18 +18,18 @@ export class GmailAdapter {
   private breaker = new CircuitBreaker('Gmail');
   private gmail;
 
-  constructor() {
-    const auth = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET,
-    );
-    auth.setCredentials({
-      refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
-    });
-    this.gmail = google.gmail({ version: 'v1', auth });
+  constructor(auth?: any) {
+    const authClient = auth ?? (() => {
+      const a = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+      );
+      a.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+      return a;
+    })();
+    this.gmail = google.gmail({ version: 'v1', auth: authClient });
   }
 
-  // Busca emails por query — mismo formato que Gmail search
   async searchEmails(query: string, maxResults = 10): Promise<EmailMessage[]> {
     const cacheKey = `gmail:${query}:${maxResults}`;
     const cached = cache.get<EmailMessage[]>(cacheKey);
@@ -52,7 +48,6 @@ export class GmailAdapter {
     const messages = result.data.messages ?? [];
     if (messages.length === 0) return [];
 
-    // Obtener detalles de cada mensaje
     const emails = await Promise.all(
       messages.slice(0, maxResults).map(async msg => {
         const detail = await this.breaker.call(() =>
@@ -65,11 +60,9 @@ export class GmailAdapter {
             })
           )
         );
-
         const headers = detail.data.payload?.headers ?? [];
         const getHeader = (name: string) =>
           headers.find(h => h.name?.toLowerCase() === name.toLowerCase())?.value ?? '';
-
         return {
           id: msg.id!,
           from: getHeader('From'),
@@ -81,11 +74,10 @@ export class GmailAdapter {
       })
     );
 
-    cache.set(cacheKey, emails, 2 * 60 * 1000); // cache 2 minutos
+    cache.set(cacheKey, emails, 2 * 60 * 1000);
     return emails;
   }
 
-  // Envía un email
   async sendEmail(to: string, subject: string, body: string): Promise<string> {
     const email = [
       `To: ${to}`,
@@ -94,9 +86,7 @@ export class GmailAdapter {
       '',
       body,
     ].join('\n');
-
     const encoded = Buffer.from(email).toString('base64url');
-
     const result = await this.breaker.call(() =>
       withRetry(() =>
         this.gmail.users.messages.send({
@@ -105,17 +95,14 @@ export class GmailAdapter {
         })
       )
     );
-
     logger.info('Email enviado', { data: { to, subject, messageId: result.data.id } });
     return result.data.id ?? '';
   }
 
-  // Lee emails de proveedores — facturas recibidas
   async getSupplierEmails(maxResults = 10): Promise<EmailMessage[]> {
     return this.searchEmails('factura OR proveedor OR cotización OR orden', maxResults);
   }
 
-  // Lee emails de pagos recibidos
   async getPaymentEmails(maxResults = 10): Promise<EmailMessage[]> {
     return this.searchEmails('pago OR transferencia OR depósito OR comprobante', maxResults);
   }
