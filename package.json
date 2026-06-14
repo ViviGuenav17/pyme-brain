@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
-    "build": "tsc",
+    "build": "tsc && xcopy /E /I /Y src\\web dist\\web 2>nul || cp -r src/web dist/web",
     "test": "jest",
     "test:coverage": "jest --coverage"
   },

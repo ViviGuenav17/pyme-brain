@@ -61,7 +61,7 @@ const httpServer = http.createServer(async (req, res) => {
   // ── Página de onboarding ──────────────────────────────────────────
   if (url === '/' && req.method === 'GET') {
     const html = fs.readFileSync(
-      path.join(__dirname, '..', 'src', 'web', 'onboarding.html'), 'utf-8'
+      path.join(__dirname, 'web', 'onboarding.html'), 'utf-8'
     );
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(html);
