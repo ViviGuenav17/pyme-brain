@@ -7,6 +7,7 @@ import { SheetsAdapter } from "./adapters/sheets.adapter.js";
 import { registerBITools } from "./tools/bi.js";
 import { registerCobrosTools } from "./tools/cobros.js";
 import { registerInventarioTools } from "./tools/inventario.js";
+import { registerVentasTools } from "./tools/ventas.js";
 import { logger } from "./utils/logger.js";
 
 // Inicializar adaptador
@@ -48,6 +49,7 @@ const httpServer = http.createServer(async (req, res) => {
       registerBITools(server, sheets);
       registerCobrosTools(server, sheets);
       registerInventarioTools(server, sheets);
+      registerVentasTools(server, sheets);
 
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => sessionId,
