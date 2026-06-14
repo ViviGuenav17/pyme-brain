@@ -469,4 +469,277 @@ export function registerBITools(server: McpServer, sheets: SheetsAdapter) {
       });
     }
   );
+  server.tool(
+    'get_supplier_performance',
+    `Analiza el desempeño de proveedores según historial de compras e inventario.
+    
+    CUÁNDO USAR: El dueño pregunta "¿cómo me ha ido con mis proveedores?",
+    "¿qué proveedor es más confiable?", "¿a quién le compro más?".
+    
+    DEVUELVE: Ranking de proveedores por volumen de productos y valor de inventario.`,
+    {},
+    async () => {
+      const correlationId = randomUUID();
+      logger.info('get_supplier_performance iniciado', { correlationId, tool: 'get_supplier_performance' });
+
+      return measureTool('get_supplier_performance', async () => {
+        const productos = await sheets.getProductos();
+
+        const proveedores = new Map<string, {
+          productos: typeof productos;
+          valor_inventario: number;
+        }>();
+
+        productos.forEach(p => {
+          const prov = p.proveedor_id ?? 'Sin proveedor';
+          if (!proveedores.has(prov)) {
+            proveedores.set(prov, { productos: [], valor_inventario: 0 });
+          }
+          const data = proveedores.get(prov)!;
+          data.productos.push(p);
+          data.valor_inventario += p.stock_actual * p.costo_unitario;
+        });
+
+        const ranking = Array.from(proveedores.entries()).map(([proveedor_id, data]) => ({
+          proveedor_id,
+          total_productos: data.productos.length,
+          valor_inventario_bob: data.valor_inventario,
+          productos: data.productos.map(p => ({
+            producto: p.producto,
+            sku: p.sku,
+            stock_actual: p.stock_actual,
+            costo_unitario_bob: p.costo_unitario,
+          })),
+          productos_bajo_stock: data.productos.filter(p => p.stock_actual <= p.punto_reorden).length,
+        })).sort((a, b) => b.valor_inventario_bob - a.valor_inventario_bob);
+
+        const result = {
+          moneda: 'BOB',
+          total_proveedores: ranking.length,
+          ranking_proveedores: ranking,
+          recomendacion: `El proveedor con mayor valor de inventario es ${ranking[0]?.proveedor_id} ` +
+            `con Bs. ${ranking[0]?.valor_inventario_bob.toLocaleString('es-BO')} en stock.`,
+        };
+
+        logger.info('get_supplier_performance completado', {
+          correlationId, tool: 'get_supplier_performance',
+          data: { total_proveedores: ranking.length },
+        });
+
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+      });
+    }
+  );
+
+  server.tool(
+    'get_revenue_by_channel',
+    `Compara leads y ventas potenciales por canal de origen.
+    
+    CUÁNDO USAR: El dueño pregunta "¿de dónde vienen mis clientes?",
+    "¿qué canal me funciona mejor?", "¿debo invertir más en Instagram o WhatsApp?".
+    
+    DEVUELVE: Leads y valor potencial por canal con recomendación de dónde enfocarse.`,
+    {},
+    async () => {
+      const correlationId = randomUUID();
+      logger.info('get_revenue_by_channel iniciado', { correlationId, tool: 'get_revenue_by_channel' });
+
+      return measureTool('get_revenue_by_channel', async () => {
+        const [leads, productos] = await Promise.all([
+          sheets.getLeads(),
+          sheets.getProductos(),
+        ]);
+
+        const productoMap = new Map(productos.map(p => [p.producto, p.precio_venta]));
+        const canales = [...new Set(leads.map(l => l.canal_origen))];
+
+        const porCanal = canales.map(canal => {
+          const enCanal = leads.filter(l => l.canal_origen === canal);
+          const ganados = enCanal.filter(l => l.etapa === 'ganado');
+          const activos = enCanal.filter(l => l.etapa !== 'ganado' && l.etapa !== 'perdido');
+          const valorPotencial = activos.reduce((s, l) => s + (productoMap.get(l.producto_interes) ?? 0), 0);
+          const valorGanado = ganados.reduce((s, l) => s + (productoMap.get(l.producto_interes) ?? 0), 0);
+
+          return {
+            canal,
+            total_leads: enCanal.length,
+            leads_activos: activos.length,
+            leads_ganados: ganados.length,
+            tasa_conversion_porcentaje: enCanal.length > 0
+              ? Math.round((ganados.length / enCanal.length) * 100)
+              : 0,
+            valor_ganado_bob: valorGanado,
+            valor_potencial_bob: valorPotencial,
+          };
+        }).sort((a, b) => b.total_leads - a.total_leads);
+
+        const mejorCanal = [...porCanal].sort((a, b) =>
+          b.tasa_conversion_porcentaje - a.tasa_conversion_porcentaje
+        )[0];
+
+        const result = {
+          moneda: 'BOB',
+          total_leads: leads.length,
+          por_canal: porCanal,
+          mejor_canal_conversion: mejorCanal?.canal ?? '-',
+          recomendacion: mejorCanal
+            ? `📊 ${mejorCanal.canal} tiene la mejor tasa de conversión (${mejorCanal.tasa_conversion_porcentaje}%). Enfoca más esfuerzo en ese canal.`
+            : 'No hay suficientes datos para comparar canales.',
+        };
+
+        logger.info('get_revenue_by_channel completado', {
+          correlationId, tool: 'get_revenue_by_channel',
+          data: { canales: canales.length },
+        });
+
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+      });
+    }
+  );
+
+  server.tool(
+    'get_slow_moving_products',
+    `Identifica productos con poca rotación que inmovilizan capital.
+    
+    CUÁNDO USAR: El dueño pregunta "¿qué productos no se venden?",
+    "¿qué tengo empolvado en el almacén?", "¿dónde tengo capital inmovilizado?".
+    
+    DEVUELVE: Productos con exceso de stock y capital inmovilizado en BOB.`,
+    {
+      threshold_ratio: z.number().min(1).max(10).default(3).describe(
+        'Stock actual / punto de reorden. Si es mayor al umbral se considera lento. Default: 3'
+      ),
+    },
+    async ({ threshold_ratio }) => {
+      const correlationId = randomUUID();
+      logger.info('get_slow_moving_products iniciado', { correlationId, tool: 'get_slow_moving_products' });
+
+      return measureTool('get_slow_moving_products', async () => {
+        const productos = await sheets.getProductos();
+
+        const lentos = productos
+          .filter(p => p.punto_reorden > 0 && (p.stock_actual / p.punto_reorden) >= threshold_ratio)
+          .map(p => ({
+            id: p.id,
+            producto: p.producto,
+            sku: p.sku,
+            almacen: p.almacen ?? 'Principal',
+            stock_actual: p.stock_actual,
+            punto_reorden: p.punto_reorden,
+            ratio_stock: Math.round(p.stock_actual / p.punto_reorden * 10) / 10,
+            capital_inmovilizado_bob: p.stock_actual * p.costo_unitario,
+            fecha_vencimiento: p.fecha_vencimiento ?? '-',
+            sugerencia: p.fecha_vencimiento && new Date(p.fecha_vencimiento) < new Date(Date.now() + 90 * 24 * 60 * 60 * 1000)
+              ? '⚠️ Vence pronto — considerar promoción urgente'
+              : '💡 Considerar promoción o reducir próxima orden de compra',
+          }))
+          .sort((a, b) => b.capital_inmovilizado_bob - a.capital_inmovilizado_bob);
+
+        const totalInmovilizado = lentos.reduce((s, p) => s + p.capital_inmovilizado_bob, 0);
+
+        const result = {
+          moneda: 'BOB',
+          threshold_ratio,
+          total_productos_lentos: lentos.length,
+          capital_total_inmovilizado_bob: totalInmovilizado,
+          productos: lentos,
+          recomendacion: lentos.length > 0
+            ? `💰 Tienes Bs. ${totalInmovilizado.toLocaleString('es-BO')} inmovilizados en ${lentos.length} producto(s) de baja rotación. Considera hacer promociones.`
+            : '✅ No hay productos con baja rotación significativa.',
+        };
+
+        logger.info('get_slow_moving_products completado', {
+          correlationId, tool: 'get_slow_moving_products',
+          data: { total: lentos.length, totalInmovilizado },
+        });
+
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+      });
+    }
+  );
+
+  server.tool(
+    'track_expiring_products',
+    `Lista productos que vencen en los próximos 30, 60 y 90 días.
+    
+    CUÁNDO USAR: El dueño pregunta "¿qué productos están por vencer?",
+    "¿tengo productos próximos a caducar?", "¿qué debo vender antes de que venza?".
+    
+    DEVUELVE: Productos agrupados por urgencia de vencimiento con acción recomendada.`,
+    {},
+    async () => {
+      const correlationId = randomUUID();
+      logger.info('track_expiring_products iniciado', { correlationId, tool: 'track_expiring_products' });
+
+      return measureTool('track_expiring_products', async () => {
+        const productos = await sheets.getProductos();
+        const hoy = new Date();
+
+        const conVencimiento = productos.filter(p => p.fecha_vencimiento);
+
+        const en30dias = conVencimiento.filter(p => {
+          const dias = Math.floor((new Date(p.fecha_vencimiento!).getTime() - hoy.getTime()) / (1000 * 60 * 60 * 24));
+          return dias >= 0 && dias <= 30;
+        });
+
+        const en60dias = conVencimiento.filter(p => {
+          const dias = Math.floor((new Date(p.fecha_vencimiento!).getTime() - hoy.getTime()) / (1000 * 60 * 60 * 24));
+          return dias > 30 && dias <= 60;
+        });
+
+        const en90dias = conVencimiento.filter(p => {
+          const dias = Math.floor((new Date(p.fecha_vencimiento!).getTime() - hoy.getTime()) / (1000 * 60 * 60 * 24));
+          return dias > 60 && dias <= 90;
+        });
+
+        const formatProducto = (p: typeof productos[0]) => {
+          const dias = Math.floor((new Date(p.fecha_vencimiento!).getTime() - hoy.getTime()) / (1000 * 60 * 60 * 24));
+          return {
+            producto: p.producto,
+            sku: p.sku,
+            lote: p.lote ?? '-',
+            almacen: p.almacen ?? 'Principal',
+            stock_actual: p.stock_actual,
+            fecha_vencimiento: p.fecha_vencimiento,
+            dias_para_vencer: dias,
+            valor_en_riesgo_bob: p.stock_actual * p.costo_unitario,
+          };
+        };
+
+        const result = {
+          fecha: hoy.toISOString().split('T')[0],
+          moneda: 'BOB',
+          resumen: {
+            vencen_en_30_dias: en30dias.length,
+            vencen_en_60_dias: en60dias.length,
+            vencen_en_90_dias: en90dias.length,
+          },
+          urgente_30_dias: {
+            descripcion: '🔴 Acción inmediata — promover o liquidar',
+            productos: en30dias.map(formatProducto),
+          },
+          atencion_60_dias: {
+            descripcion: '🟡 Planificar promoción esta semana',
+            productos: en60dias.map(formatProducto),
+          },
+          monitoreo_90_dias: {
+            descripcion: '🟢 Monitorear — planificar con anticipación',
+            productos: en90dias.map(formatProducto),
+          },
+          estado_general: en30dias.length > 0
+            ? '🔴 HAY PRODUCTOS POR VENCER EN MENOS DE 30 DÍAS'
+            : en60dias.length > 0
+            ? '🟡 HAY PRODUCTOS POR VENCER EN MENOS DE 60 DÍAS'
+            : '🟢 SIN VENCIMIENTOS URGENTES',
+        };
+
+        logger.info('track_expiring_products completado', {
+          correlationId, tool: 'track_expiring_products',
+          data: { en30dias: en30dias.length, en60dias: en60dias.length },
+        });
+
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+      });
+    }
+  );
 }

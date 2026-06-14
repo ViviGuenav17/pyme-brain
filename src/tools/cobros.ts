@@ -310,4 +310,226 @@ export function registerCobrosTools(server: McpServer, sheets: SheetsAdapter) {
       });
     }
   );
+  server.tool(
+    'forecast_cashflow_cobros',
+    `Proyecta cuánto dinero entrará por cobros en los próximos N días.
+    
+    CUÁNDO USAR: El dueño pregunta "¿cuánto voy a cobrar esta semana?",
+    "¿me alcanza para pagar al proveedor?", "¿cuándo entra plata?".
+    
+    DEVUELVE: Proyección de cobros por fecha con escenario optimista y pesimista.`,
+    {
+      horizon_days: z.number().min(1).max(60).default(14).describe('Días a proyectar. Default: 14'),
+    },
+    async ({ horizon_days }) => {
+      const correlationId = randomUUID();
+      logger.info('forecast_cashflow_cobros iniciado', { correlationId, tool: 'forecast_cashflow_cobros' });
+
+      return measureTool('forecast_cashflow_cobros', async () => {
+        const [clientes, cobros] = await Promise.all([
+          sheets.getClientes(),
+          sheets.getCobros(),
+        ]);
+
+        const clienteMap = new Map(clientes.map(c => [c.id, c]));
+        const fechaLimite = new Date(Date.now() + horizon_days * 24 * 60 * 60 * 1000);
+
+        const pendientes = cobros.filter(c => {
+          const fecha = new Date(c.fecha_vencimiento);
+          return c.estado === 'pendiente' && fecha <= fechaLimite;
+        });
+
+        const confiables = pendientes.filter(c => c.dias_mora <= 15);
+        const enRiesgo = pendientes.filter(c => c.dias_mora > 15);
+
+        const totalConfiable = confiables.reduce((s, c) => s + c.monto, 0);
+        const totalRiesgo = enRiesgo.reduce((s, c) => s + c.monto, 0);
+
+        const result = {
+          moneda: 'BOB',
+          horizon_days,
+          resumen: {
+            total_a_cobrar_bob: totalConfiable + totalRiesgo,
+            confiable_bob: totalConfiable,
+            en_riesgo_bob: totalRiesgo,
+            cantidad_cobros: pendientes.length,
+          },
+          cobros_confiables: confiables.map(c => ({
+            cliente: clienteMap.get(c.cliente_id)?.nombre ?? c.cliente_id,
+            monto_bob: c.monto,
+            fecha_vencimiento: c.fecha_vencimiento,
+            dias_mora: c.dias_mora,
+          })),
+          cobros_en_riesgo: enRiesgo.map(c => ({
+            cliente: clienteMap.get(c.cliente_id)?.nombre ?? c.cliente_id,
+            monto_bob: c.monto,
+            fecha_vencimiento: c.fecha_vencimiento,
+            dias_mora: c.dias_mora,
+          })),
+          escenario_optimista: `Bs. ${(totalConfiable + totalRiesgo).toLocaleString('es-BO')} si todos pagan`,
+          escenario_pesimista: `Bs. ${totalConfiable.toLocaleString('es-BO')} si los morosos no pagan`,
+        };
+
+        logger.info('forecast_cashflow_cobros completado', {
+          correlationId, tool: 'forecast_cashflow_cobros',
+          data: { totalConfiable, totalRiesgo },
+        });
+
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+      });
+    }
+  );
+
+  server.tool(
+    'get_payment_history',
+    `Historial de pagos recibidos en un período.
+    
+    CUÁNDO USAR: El dueño pregunta "¿cuánto cobré este mes?", "¿qué pagos recibí?",
+    "dame el historial de pagos", "¿cuánto entró en caja?".
+    
+    DEVUELVE: Lista de pagos recibidos con total en BOB.`,
+    {
+      days: z.number().min(1).max(365).default(30).describe('Días hacia atrás a consultar. Default: 30'),
+    },
+    async ({ days }) => {
+      const correlationId = randomUUID();
+      logger.info('get_payment_history iniciado', { correlationId, tool: 'get_payment_history' });
+
+      return measureTool('get_payment_history', async () => {
+        const [clientes, cobros] = await Promise.all([
+          sheets.getClientes(),
+          sheets.getCobros(),
+        ]);
+
+        const clienteMap = new Map(clientes.map(c => [c.id, c]));
+        const fechaInicio = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+        const pagados = cobros.filter(c => {
+          if (!c.fecha_pago) return false;
+          return c.estado === 'pagado' && new Date(c.fecha_pago) >= fechaInicio;
+        });
+
+        const total = pagados.reduce((s, c) => s + c.monto, 0);
+
+        const result = {
+          moneda: 'BOB',
+          periodo_dias: days,
+          desde: fechaInicio.toISOString().split('T')[0],
+          hasta: new Date().toISOString().split('T')[0],
+          total_cobrado_bob: total,
+          cantidad_pagos: pagados.length,
+          pagos: pagados.map(c => ({
+            cliente: clienteMap.get(c.cliente_id)?.nombre ?? c.cliente_id,
+            monto_bob: c.monto,
+            fecha_pago: c.fecha_pago,
+            notas: c.notas,
+          })).sort((a, b) => new Date(b.fecha_pago!).getTime() - new Date(a.fecha_pago!).getTime()),
+          resumen: `Cobraste Bs. ${total.toLocaleString('es-BO')} en los últimos ${days} días en ${pagados.length} pagos.`,
+        };
+
+        logger.info('get_payment_history completado', {
+          correlationId, tool: 'get_payment_history',
+          data: { total, cantidad: pagados.length },
+        });
+
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+      });
+    }
+  );
+
+  server.tool(
+    'suggest_credit_limit',
+    `Analiza el comportamiento de pago de un cliente y sugiere ajuste de crédito.
+    
+    CUÁNDO USAR: El dueño pregunta "¿le doy más crédito a Quispe?",
+    "¿debo reducir el crédito de Flores?", "¿cuánto crédito le doy a este cliente?".
+    
+    DEVUELVE: Análisis del comportamiento de pago y recomendación de límite de crédito.`,
+    {
+      client_id: z.string().describe('ID del cliente. Ejemplo: C001'),
+    },
+    async ({ client_id }) => {
+      const correlationId = randomUUID();
+      logger.info('suggest_credit_limit iniciado', { correlationId, tool: 'suggest_credit_limit' });
+
+      return measureTool('suggest_credit_limit', async () => {
+        const [clientes, cobros] = await Promise.all([
+          sheets.getClientes(),
+          sheets.getCobros(),
+        ]);
+
+        const cliente = clientes.find(c => c.id === client_id);
+        if (!cliente) {
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify({ error: `Cliente ${client_id} no encontrado` }),
+            }],
+          };
+        }
+
+        const cobrosCliente = cobros.filter(c => c.cliente_id === client_id);
+        const pagados = cobrosCliente.filter(c => c.estado === 'pagado');
+        const pendientes = cobrosCliente.filter(c => c.estado === 'pendiente');
+        const morosos = pendientes.filter(c => c.dias_mora > 30);
+
+        const moraProm = pendientes.length > 0
+          ? Math.round(pendientes.reduce((s, c) => s + c.dias_mora, 0) / pendientes.length)
+          : 0;
+
+        let credito_sugerido = cliente.credito_limite;
+        let accion = 'MANTENER';
+        let razon = '';
+
+        if (cliente.score_pago >= 85 && morosos.length === 0) {
+          credito_sugerido = Math.round(cliente.credito_limite * 1.2);
+          accion = 'AUMENTAR';
+          razon = 'Excelente historial de pagos y sin mora actual';
+        } else if (cliente.score_pago < 60 || morosos.length > 0) {
+          credito_sugerido = Math.round(cliente.credito_limite * 0.7);
+          accion = 'REDUCIR';
+          razon = morosos.length > 0
+            ? `Tiene ${morosos.length} cobro(s) con mora mayor a 30 días`
+            : 'Score de pago bajo';
+        } else {
+          razon = 'Comportamiento de pago estable';
+        }
+
+        const result = {
+          moneda: 'BOB',
+          cliente: {
+            id: cliente.id,
+            nombre: cliente.nombre,
+            credito_limite_actual_bob: cliente.credito_limite,
+            score_pago: cliente.score_pago,
+          },
+          analisis: {
+            total_cobros: cobrosCliente.length,
+            pagados: pagados.length,
+            pendientes: pendientes.length,
+            con_mora_30d: morosos.length,
+            mora_promedio_dias: moraProm,
+          },
+          recomendacion: {
+            accion,
+            credito_sugerido_bob: credito_sugerido,
+            variacion_bob: credito_sugerido - cliente.credito_limite,
+            razon,
+          },
+          mensaje: accion === 'AUMENTAR'
+            ? `✅ Recomendamos aumentar el crédito de ${cliente.nombre} de Bs. ${cliente.credito_limite.toLocaleString('es-BO')} a Bs. ${credito_sugerido.toLocaleString('es-BO')}`
+            : accion === 'REDUCIR'
+            ? `⚠️ Recomendamos reducir el crédito de ${cliente.nombre} de Bs. ${cliente.credito_limite.toLocaleString('es-BO')} a Bs. ${credito_sugerido.toLocaleString('es-BO')}`
+            : `📋 Mantener el crédito de ${cliente.nombre} en Bs. ${cliente.credito_limite.toLocaleString('es-BO')}`,
+        };
+
+        logger.info('suggest_credit_limit completado', {
+          correlationId, tool: 'suggest_credit_limit',
+          data: { client_id, accion, credito_sugerido },
+        });
+
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+      });
+    }
+  );
 }
