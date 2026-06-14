@@ -4,14 +4,25 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { randomUUID } from "crypto";
 import http from "http";
 import { SheetsAdapter } from "./adapters/sheets.adapter.js";
+import { GmailAdapter } from "./adapters/gmail.adapter.js";
+import { DriveAdapter } from "./adapters/drive.adapter.js";
+import { CalendarAdapter } from "./adapters/calendar.adapter.js";
+import { TasksAdapter } from "./adapters/tasks.adapter.js";
+import { DocsAdapter } from "./adapters/docs.adapter.js";
 import { registerBITools } from "./tools/bi.js";
 import { registerCobrosTools } from "./tools/cobros.js";
 import { registerInventarioTools } from "./tools/inventario.js";
 import { registerVentasTools } from "./tools/ventas.js";
+import { registerGoogleTools } from "./tools/google.js";
 import { logger } from "./utils/logger.js";
 
-// Inicializar adaptador
+// Inicializar adaptadores
 const sheets = new SheetsAdapter();
+const gmail = new GmailAdapter();
+const drive = new DriveAdapter();
+const calendar = new CalendarAdapter();
+const tasks = new TasksAdapter();
+const docs = new DocsAdapter();
 
 // Mapa de sesiones activas
 const sessions = new Map<string, { server: McpServer; transport: StreamableHTTPServerTransport }>();
@@ -31,6 +42,14 @@ const httpServer = http.createServer(async (req, res) => {
       ciudad: empresaConfig?.ciudad ?? "",
       moneda: empresaConfig?.moneda ?? "BOB",
       uptime: process.uptime(),
+      integraciones: {
+        sheets: "✅",
+        gmail: "✅",
+        drive: "✅",
+        calendar: "✅",
+        tasks: "✅",
+        docs: "✅",
+      }
     }));
     return;
   }
@@ -50,6 +69,7 @@ const httpServer = http.createServer(async (req, res) => {
       registerCobrosTools(server, sheets);
       registerInventarioTools(server, sheets);
       registerVentasTools(server, sheets);
+      registerGoogleTools(server, gmail, drive, calendar, tasks, docs);
 
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => sessionId,
@@ -91,6 +111,7 @@ sheets.initialize().then(() => {
     console.log(`   Moneda:  ${config?.moneda}`);
     console.log(`   Health:  http://localhost:${PORT}/health`);
     console.log(`   MCP:     http://localhost:${PORT}/mcp`);
+    console.log(`   Google:  Sheets ✅ Gmail ✅ Drive ✅ Calendar ✅ Tasks ✅ Docs ✅`);
   });
 }).catch(err => {
   logger.error('Error al inicializar configuración', { error: String(err) });
