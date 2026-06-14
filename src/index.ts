@@ -18,12 +18,11 @@ import { registerInventarioTools } from "./tools/inventario.js";
 import { registerVentasTools } from "./tools/ventas.js";
 import { registerGoogleTools } from "./tools/google.js";
 import { logger } from "./utils/logger.js";
-import { initDB, upsertEmpresa, getEmpresaById } from "./auth/db.js";
+import { initDB, upsertEmpresa } from "./auth/db.js";
 import { getAuthUrl, exchangeCodeForTokens, getUserInfo } from "./auth/oauth.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Adaptadores base (empresa de demo)
 const sheets = new SheetsAdapter();
 const gmail = new GmailAdapter();
 const drive = new DriveAdapter();
@@ -31,21 +30,8 @@ const calendar = new CalendarAdapter();
 const tasks = new TasksAdapter();
 const docs = new DocsAdapter();
 
-// Mapa de sesiones activas
 const sessions = new Map<string, { server: McpServer; transport: StreamableHTTPServerTransport }>();
 
-// Parsear body de requests
-function parseBody(req: http.IncomingMessage): Promise<Record<string, string>> {
-  return new Promise((resolve) => {
-    let body = '';
-    req.on('data', chunk => body += chunk);
-    req.on('end', () => {
-      try { resolve(JSON.parse(body)); } catch { resolve({}); }
-    });
-  });
-}
-
-// Parsear query string
 function parseQuery(url: string): Record<string, string> {
   const idx = url.indexOf('?');
   if (idx === -1) return {};
@@ -55,16 +41,40 @@ function parseQuery(url: string): Record<string, string> {
   return result;
 }
 
+function getOnboardingHTML(): string {
+  const paths = [
+    path.join(__dirname, 'web', 'onboarding.html'),
+    path.join(__dirname, '..', 'src', 'web', 'onboarding.html'),
+  ];
+  for (const p of paths) {
+    if (fs.existsSync(p)) return fs.readFileSync(p, 'utf-8');
+  }
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"/>
+    <title>PyME Brain</title>
+    <style>body{font-family:sans-serif;display:flex;align-items:center;
+    justify-content:center;min-height:100vh;margin:0;background:#f8f9fa;}
+    .card{background:white;border-radius:16px;padding:48px 40px;max-width:480px;
+    width:90%;text-align:center;box-shadow:0 4px 24px rgba(0,0,0,0.08);}
+    h1{color:#1a1a2e;margin-bottom:8px;}p{color:#666;margin-bottom:32px;}
+    a{display:inline-block;padding:14px 32px;background:#4285F4;color:white;
+    border-radius:10px;text-decoration:none;font-size:16px;font-weight:500;}
+    a:hover{background:#3367d6;}</style>
+    </head><body><div class="card">
+    <div style="font-size:48px">🧠</div>
+    <h1>PyME Brain</h1>
+    <p>Tu asistente de IA para PYMEs bolivianas.<br/>
+    Conecta tu cuenta Google para comenzar.</p>
+    <a href="/auth/google">Conectar con Google</a>
+    </div></body></html>`;
+}
+
 const httpServer = http.createServer(async (req, res) => {
   const url = req.url ?? '/';
 
   // ── Página de onboarding ──────────────────────────────────────────
   if (url === '/' && req.method === 'GET') {
-    const html = fs.readFileSync(
-      path.join(__dirname, 'web', 'onboarding.html'), 'utf-8'
-    );
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(html);
+    res.end(getOnboardingHTML());
     return;
   }
 
@@ -103,43 +113,32 @@ const httpServer = http.createServer(async (req, res) => {
       });
 
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(`
-        <!DOCTYPE html>
-        <html lang="es">
-        <head>
-          <meta charset="UTF-8"/>
-          <title>PyME Brain — Conectado</title>
-          <style>
-            body { font-family: -apple-system, sans-serif; background: #f8f9fa;
-                   display: flex; align-items: center; justify-content: center;
-                   min-height: 100vh; margin: 0; }
-            .card { background: white; border-radius: 16px; padding: 48px 40px;
-                    max-width: 480px; width: 90%; text-align: center;
-                    box-shadow: 0 4px 24px rgba(0,0,0,0.08); }
-            h1 { color: #2e7d32; font-size: 24px; margin: 16px 0 8px; }
-            p { color: #666; font-size: 15px; line-height: 1.6; margin-bottom: 8px; }
-            .id { font-family: monospace; background: #f0f0f0; padding: 8px 16px;
-                  border-radius: 8px; font-size: 13px; margin: 16px 0;
-                  word-break: break-all; }
-            .tip { font-size: 13px; color: #888; margin-top: 24px; }
-          </style>
-        </head>
-        <body>
-          <div class="card">
-            <div style="font-size:48px">✅</div>
-            <h1>¡Negocio conectado!</h1>
-            <p>Hola <strong>${userInfo.name ?? userInfo.email}</strong>,<br/>
-               tu cuenta Google está vinculada a PyME Brain.</p>
-            <p>Tu ID de empresa:</p>
-            <div class="id">${empresa.id}</div>
-            <p class="tip">
-              Usa este ID como parámetro <code>empresa_id</code> al conectar 
-              tu MCP server en Claude o ChatGPT.
-            </p>
-          </div>
-        </body>
-        </html>
-      `);
+      res.end(`<!DOCTYPE html>
+        <html lang="es"><head><meta charset="UTF-8"/>
+        <title>PyME Brain — Conectado</title>
+        <style>
+          body{font-family:sans-serif;background:#f8f9fa;display:flex;
+          align-items:center;justify-content:center;min-height:100vh;margin:0;}
+          .card{background:white;border-radius:16px;padding:48px 40px;
+          max-width:480px;width:90%;text-align:center;
+          box-shadow:0 4px 24px rgba(0,0,0,0.08);}
+          h1{color:#2e7d32;font-size:24px;margin:16px 0 8px;}
+          p{color:#666;font-size:15px;line-height:1.6;margin-bottom:8px;}
+          .id{font-family:monospace;background:#f0f0f0;padding:8px 16px;
+          border-radius:8px;font-size:13px;margin:16px 0;word-break:break-all;}
+          .tip{font-size:13px;color:#888;margin-top:24px;}
+        </style></head>
+        <body><div class="card">
+          <div style="font-size:48px">✅</div>
+          <h1>¡Negocio conectado!</h1>
+          <p>Hola <strong>${userInfo.name ?? userInfo.email}</strong>,<br/>
+          tu cuenta Google está vinculada a PyME Brain.</p>
+          <p>Tu ID de empresa:</p>
+          <div class="id">${empresa.id}</div>
+          <p class="tip">Usa este ID como parámetro <code>empresa_id</code>
+          al conectar tu MCP server en Claude o ChatGPT.</p>
+        </div></body></html>`);
+
     } catch (err) {
       logger.error('Error en OAuth callback', { error: String(err) });
       res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -204,7 +203,6 @@ const httpServer = http.createServer(async (req, res) => {
 
 const PORT = process.env.PORT ?? 3000;
 
-// Inicializar DB y servidor
 async function main() {
   await initDB();
   logger.info('Base de datos PostgreSQL inicializada');
