@@ -17,6 +17,7 @@ import { registerCobrosTools } from "./tools/cobros.js";
 import { registerInventarioTools } from "./tools/inventario.js";
 import { registerVentasTools } from "./tools/ventas.js";
 import { registerGoogleTools } from "./tools/google.js";
+import { registerFacturacionTools } from "./tools/facturacion.js";
 import { logger } from "./utils/logger.js";
 import { initDB, upsertEmpresa } from "./auth/db.js";
 import { getAuthUrl, exchangeCodeForTokens, getUserInfo } from "./auth/oauth.js";
@@ -211,6 +212,7 @@ const httpServer = http.createServer(async (req, res) => {
       registerInventarioTools(server, activeSheets);
       registerVentasTools(server, activeSheets);
       registerGoogleTools(server, activeGmail, activeDrive, activeCalendar, activeTasks, activeDocs);
+      registerFacturacionTools(server, sheets);
 
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => sessionId,
