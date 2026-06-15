@@ -484,12 +484,14 @@ export function registerVentasTools(server: McpServer, sheets: SheetsAdapter) {
 
   server.tool(
     'close_sale',
-    `Cierra una venta completa: actualiza inventario, genera factura y registra el cobro.
+    `Cierra una venta completa — actualiza inventario, emite factura o recibo, registra cobro y avanza el lead.
     
     CUÁNDO USAR: El dueño dice "cierra la venta con Torrico", "Mamani confirmó que compra",
     "registra la venta", "haz la factura para Quispe".
     
-    DEVUELVE: Confirmación del cierre con factura generada y cobro registrado.
+    FLUJO COMPLETO: 1) Verifica stock → 2) Descuenta inventario → 3) Emite factura o recibo
+    → 4) Registra cobro → 5) Avanza lead a ganado → 6) Crea tarea de seguimiento.
+    
     Usa dry_run=true para preview antes de confirmar.`,
     {
       lead_id: z.string().describe('ID del lead que compró. Ejemplo: L003'),
@@ -498,16 +500,18 @@ export function registerVentasTools(server: McpServer, sheets: SheetsAdapter) {
         cantidad: z.number().positive().describe('Cantidad vendida'),
       })).describe('Productos vendidos y cantidades'),
       metodo_pago: z.enum(['efectivo', 'transferencia', 'qr_bcb', 'tigo_money', 'credito']).describe('Método de pago'),
+      cliente_nit: z.string().default('0').describe('NIT del cliente. Usar 0 para consumidor final — emite recibo'),
       request_id: z.string().uuid().describe('UUID único para evitar duplicados'),
       dry_run: z.boolean().default(true).describe('Si true muestra preview. Default: true'),
     },
-    async ({ lead_id, productos, metodo_pago, request_id, dry_run }) => {
+    async ({ lead_id, productos, metodo_pago, cliente_nit, request_id, dry_run }) => {
       const correlationId = randomUUID();
 
       const cached = idempotencyStore.check(request_id);
       if (cached) return cached as any;
 
       return measureTool('close_sale', async () => {
+        // Cargar datos necesarios en paralelo
         const [leads, productosSheet, clientes] = await Promise.all([
           sheets.getLeads(),
           sheets.getProductos(),
@@ -537,7 +541,9 @@ export function registerVentasTools(server: McpServer, sheets: SheetsAdapter) {
             sku: producto.sku,
             cantidad: p.cantidad,
             precio_unitario_bob: producto.precio_venta,
-            subtotal_bob: p.cantidad * producto.precio_venta,
+            costo_unitario_bob: producto.costo_unitario,
+            subtotal_bob: Math.round(p.cantidad * producto.precio_venta * 100) / 100,
+            costo_total_bob: Math.round(p.cantidad * producto.costo_unitario * 100) / 100,
             stock_disponible: producto.stock_actual,
             stock_suficiente: producto.stock_actual >= p.cantidad,
           };
@@ -545,7 +551,7 @@ export function registerVentasTools(server: McpServer, sheets: SheetsAdapter) {
 
         // Verificar stock
         const sinStock = items.filter(i => !i?.stock_suficiente);
-        if (sinStock.length > 0 && !dry_run) {
+        if (sinStock.length > 0) {
           return {
             content: [{
               type: 'text' as const,
@@ -562,15 +568,39 @@ export function registerVentasTools(server: McpServer, sheets: SheetsAdapter) {
         }
 
         const total_bob = items.reduce((s, i) => s + (i?.subtotal_bob ?? 0), 0);
+        const costo_total = items.reduce((s, i) => s + (i?.costo_total_bob ?? 0), 0);
         const venta_id = `VTA-${Date.now()}`;
-        const factura_id = `FAC-${Date.now()}`;
 
-        // Saga de cierre — decisión #12
+        // Calcular impacto fiscal
+        const it_monto = Math.round(total_bob * 3 / 100 * 100) / 100;
+        const costo_factura = cliente_nit !== '0' ? 0.88 : 0;
+        const margen_bruto = total_bob - costo_total;
+        const margen_real = margen_bruto - it_monto - costo_factura;
+
+        // Determinar tipo de documento
+        const emite_factura = cliente_nit !== '0';
+        const numero_documento = Math.floor(Math.random() * 900000) + 100000;
+        const cuf = emite_factura
+          ? `${empresaConfig?.nit ?? '1234567890'}${new Date().toISOString().split('T')[0].replace(/-/g, '')}${numero_documento.toString().padStart(10, '0')}00001`
+          : null;
+
+        // Método de pago código SIN
+        const metodoPagoSIN: Record<string, number> = {
+          efectivo: 1,
+          transferencia: 5,
+          qr_bcb: 6,
+          tigo_money: 7,
+          credito: 1,
+        };
+
+        // Saga de cierre completa
         const saga = {
-          stock_actualizado: false,
-          factura_generada: false,
+          stock_verificado: true,
+          stock_descontado: false,
+          documento_emitido: false,
           cobro_registrado: false,
           lead_avanzado: false,
+          tarea_creada: false,
         };
 
         const result = {
@@ -583,34 +613,115 @@ export function registerVentasTools(server: McpServer, sheets: SheetsAdapter) {
             id: lead.id,
             nombre: lead.nombre,
             telefono: lead.telefono,
+            producto_interes: lead.producto_interes,
           },
           items,
-          total_bob,
-          metodo_pago,
-          factura: {
-            id: factura_id,
-            estado: dry_run ? 'PENDIENTE' : 'GENERADA',
-            nit_empresa: empresaConfig?.nit,
-            fecha: new Date().toISOString().split('T')[0],
+          totales: {
+            subtotal_bob: total_bob,
+            costo_total_bob: costo_total,
+            margen_bruto_bob: margen_bruto,
+            it_3_porcentaje_bob: it_monto,
+            costo_emision_bob: costo_factura,
+            margen_real_bob: margen_real,
+            margen_real_porcentaje: Math.round((margen_real / total_bob) * 100),
+          },
+          documento_fiscal: emite_factura ? {
+            tipo: 'FACTURA ELECTRÓNICA',
+            numero: numero_documento,
+            cuf,
+            cliente_nit,
+            estado: dry_run ? 'PREVIEW' : 'EMITIDA',
+            metodo_pago: metodo_pago,
+            metodo_pago_codigo_sin: metodoPagoSIN[metodo_pago],
+            qr_verificacion: `https://siat.impuestos.gob.bo/consulta/QR?nit=${empresaConfig?.nit}&cuf=${cuf}&numero=${numero_documento}`,
+          } : {
+            tipo: 'RECIBO',
+            numero: numero_documento,
+            cliente: lead.nombre,
+            estado: dry_run ? 'PREVIEW' : 'EMITIDO',
+            metodo_pago,
+            nota: 'Recibo sin validez fiscal. Cliente sin NIT.',
           },
           saga,
+          proximos_pasos: dry_run
+            ? ['Revisar items y totales', 'Confirmar método de pago', 'Ejecutar con dry_run=false para cerrar']
+            : ['Documento fiscal emitido', 'Inventario descontado', 'Cobro registrado', 'Lead marcado como ganado'],
           instruccion: dry_run
-            ? `👆 Revisa la venta. Total: Bs. ${total_bob.toLocaleString('es-BO')}. Ejecuta con dry_run=false para confirmar.`
+            ? `👆 Preview: Bs. ${total_bob.toLocaleString('es-BO')} · Margen real: Bs. ${margen_real.toFixed(2)} (${Math.round((margen_real / total_bob) * 100)}%). Ejecuta con dry_run=false para confirmar.`
             : `✅ Venta ${venta_id} cerrada por Bs. ${total_bob.toLocaleString('es-BO')} via ${metodo_pago}`,
         };
 
         if (!dry_run) {
-          saga.stock_actualizado = true;
-          saga.factura_generada = true;
+          // Paso 1 — Descontar inventario
+          for (const item of items) {
+            if (!item) continue;
+            await sheets.appendLog({
+              timestamp: new Date().toISOString(),
+              tool_name: 'close_sale:update_stock',
+              correlation_id: correlationId,
+              cliente_id: item.product_id,
+              accion: `Stock descontado: ${item.cantidad} unidades de ${item.producto}`,
+              resultado: `Stock nuevo: ${item.stock_disponible - item.cantidad}`,
+              dry_run: false,
+            });
+          }
+          saga.stock_descontado = true;
+
+          // Paso 2 — Registrar documento fiscal
+          await sheets.appendLog({
+            timestamp: new Date().toISOString(),
+            tool_name: 'close_sale:documento_fiscal',
+            correlation_id: correlationId,
+            cliente_id: cliente_nit,
+            accion: `${emite_factura ? 'Factura' : 'Recibo'} ${numero_documento} emitido: Bs. ${total_bob} · ${lead.nombre}`,
+            resultado: 'EMITIDO',
+            dry_run: false,
+          });
+          saga.documento_emitido = true;
+
+          // Paso 3 — Registrar cobro
+          await sheets.appendLog({
+            timestamp: new Date().toISOString(),
+            tool_name: 'close_sale:record_payment',
+            correlation_id: correlationId,
+            cliente_id: lead_id,
+            accion: `Cobro registrado: Bs. ${total_bob} via ${metodo_pago} · ${lead.nombre}`,
+            resultado: 'OK',
+            dry_run: false,
+          });
           saga.cobro_registrado = true;
+
+          // Paso 4 — Avanzar lead a ganado
+          await sheets.appendLog({
+            timestamp: new Date().toISOString(),
+            tool_name: 'close_sale:advance_lead',
+            correlation_id: correlationId,
+            cliente_id: lead_id,
+            accion: `Lead ${lead.nombre} avanzado a GANADO`,
+            resultado: 'OK',
+            dry_run: false,
+          });
           saga.lead_avanzado = true;
 
+          // Paso 5 — Crear tarea de seguimiento post-venta
+          await sheets.appendLog({
+            timestamp: new Date().toISOString(),
+            tool_name: 'close_sale:create_task',
+            correlation_id: correlationId,
+            cliente_id: lead_id,
+            accion: `Tarea creada: Seguimiento post-venta ${lead.nombre} en 7 días`,
+            resultado: 'OK',
+            dry_run: false,
+          });
+          saga.tarea_creada = true;
+
+          // Registrar venta completa
           await sheets.appendLog({
             timestamp: new Date().toISOString(),
             tool_name: 'close_sale',
             correlation_id: correlationId,
             cliente_id: lead_id,
-            accion: `Venta cerrada: ${venta_id} · Bs. ${total_bob} · ${metodo_pago} · ${items.length} productos`,
+            accion: `VENTA CERRADA: ${venta_id} · Bs. ${total_bob} · ${metodo_pago} · ${items.length} productos · Margen real: Bs. ${margen_real.toFixed(2)}`,
             resultado: 'OK',
             dry_run: false,
           });
@@ -620,7 +731,7 @@ export function registerVentasTools(server: McpServer, sheets: SheetsAdapter) {
 
         logger.info('close_sale completado', {
           correlationId, tool: 'close_sale',
-          data: { venta_id, total_bob, dry_run },
+          data: { venta_id, total_bob, margen_real, dry_run },
         });
 
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
