@@ -12,16 +12,19 @@ import { DriveAdapter } from "./adapters/drive.adapter.js";
 import { CalendarAdapter } from "./adapters/calendar.adapter.js";
 import { TasksAdapter } from "./adapters/tasks.adapter.js";
 import { DocsAdapter } from "./adapters/docs.adapter.js";
+import { WhatsAppAdapter } from "./adapters/whatsapp.adapter.js";
 import { registerBITools } from "./tools/bi.js";
 import { registerCobrosTools } from "./tools/cobros.js";
 import { registerInventarioTools } from "./tools/inventario.js";
 import { registerVentasTools } from "./tools/ventas.js";
 import { registerGoogleTools } from "./tools/google.js";
 import { registerFacturacionTools } from "./tools/facturacion.js";
+import { registerWhatsappTools } from "./tools/whatsapp.js";
 import { logger } from "./utils/logger.js";
 import { initDB, upsertEmpresa } from "./auth/db.js";
 import { getAuthUrl, exchangeCodeForTokens, getUserInfo } from "./auth/oauth.js";
 import { getAdaptersForEmpresa } from "./auth/tenant.js";
+import { handleWhatsAppWebhookVerify, handleWhatsAppWebhookEvent } from "./webhooks/whatsapp-webhook.handler.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -32,6 +35,7 @@ const drive = new DriveAdapter();
 const calendar = new CalendarAdapter();
 const tasks = new TasksAdapter();
 const docs = new DocsAdapter();
+const whatsapp = new WhatsAppAdapter(); // fallback a .env — número de prueba demo
 
 const sessions = new Map<string, { server: McpServer; transport: StreamableHTTPServerTransport }>();
 
@@ -150,6 +154,18 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Webhook de WhatsApp — verificación (Meta llama esto una sola vez) ──
+  if (url.startsWith('/webhooks/whatsapp') && req.method === 'GET') {
+    handleWhatsAppWebhookVerify(req, res);
+    return;
+  }
+
+  // ── Webhook de WhatsApp — mensajes entrantes en tiempo real ─────────
+  if (url.startsWith('/webhooks/whatsapp') && req.method === 'POST') {
+    await handleWhatsAppWebhookEvent(req, res);
+    return;
+  }
+
   // ── Health check ──────────────────────────────────────────────────
   if (url === '/health' && req.method === 'GET') {
     const empresaConfig = sheets.getEmpresaConfig();
@@ -166,6 +182,7 @@ const httpServer = http.createServer(async (req, res) => {
         sheets: '✅', gmail: '✅', drive: '✅',
         calendar: '✅', tasks: '✅', docs: '✅',
         database: '✅',
+        whatsapp: whatsapp.isConfigured() ? '✅' : '⚠️ no configurado',
       }
     }));
     return;
@@ -187,6 +204,7 @@ const httpServer = http.createServer(async (req, res) => {
       let activeCalendar = calendar;
       let activeTasks = tasks;
       let activeDocs = docs;
+      let activeWhatsapp = whatsapp;
 
       if (empresaId) {
         try {
@@ -197,6 +215,7 @@ const httpServer = http.createServer(async (req, res) => {
           activeCalendar = tenant.calendar;
           activeTasks = tenant.tasks;
           activeDocs = tenant.docs;
+          activeWhatsapp = tenant.whatsapp;
           logger.info('Sesión MCP multi-tenant', {
             data: { sessionId, empresa_id: empresaId, nombre: tenant.empresa_nombre }
           });
@@ -213,6 +232,7 @@ const httpServer = http.createServer(async (req, res) => {
       registerVentasTools(server, activeSheets);
       registerGoogleTools(server, activeGmail, activeDrive, activeCalendar, activeTasks, activeDocs);
       registerFacturacionTools(server, sheets);
+      registerWhatsappTools(server, activeWhatsapp, activeSheets);
 
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => sessionId,
@@ -247,9 +267,10 @@ async function main() {
   httpServer.listen(PORT, () => {
     logger.info('PyME Brain iniciado', { data: { port: PORT } });
     console.log(`✅ PyME Brain MCP Server — ${config?.nombre_empresa}`);
-    console.log(`   Health: http://localhost:${PORT}/health`);
-    console.log(`   MCP:    http://localhost:${PORT}/mcp`);
-    console.log(`   Web:    http://localhost:${PORT}/`);
+    console.log(`   Health:   http://localhost:${PORT}/health`);
+    console.log(`   MCP:      http://localhost:${PORT}/mcp`);
+    console.log(`   Web:      http://localhost:${PORT}/`);
+    console.log(`   Webhook:  http://localhost:${PORT}/webhooks/whatsapp`);
   });
 }
 

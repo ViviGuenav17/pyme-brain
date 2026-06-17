@@ -15,13 +15,23 @@ export async function initDB(): Promise<void> {
       google_refresh_token  TEXT,
       sheet_id              TEXT,
       alegra_token          TEXT,
-      whatsapp_token        TEXT,
+      whatsapp_token              TEXT,
+      whatsapp_phone_number_id    TEXT,
+      whatsapp_business_account_id TEXT,
       nit                   TEXT,
       ciudad                TEXT,
       moneda                TEXT DEFAULT 'BOB',
       activa                BOOLEAN DEFAULT true,
       created_at            TIMESTAMPTZ DEFAULT now()
     );
+  `);
+
+  // Migración incremental — por si la tabla ya existía sin estas columnas
+  await pool.query(`
+    ALTER TABLE empresas ADD COLUMN IF NOT EXISTS whatsapp_phone_number_id TEXT;
+  `);
+  await pool.query(`
+    ALTER TABLE empresas ADD COLUMN IF NOT EXISTS whatsapp_business_account_id TEXT;
   `);
 }
 
@@ -49,6 +59,28 @@ export async function upsertEmpresa(data: {
 
 export async function getEmpresaById(id: string) {
   const res = await pool.query('SELECT * FROM empresas WHERE id = $1', [id]);
+  return res.rows[0] ?? null;
+}
+
+// Guarda las credenciales de WhatsApp Business API para una empresa.
+// Se llama desde el callback de OAuth de WhatsApp (whatsapp-oauth.ts).
+export async function updateEmpresaWhatsapp(
+  empresa_id: string,
+  data: { whatsapp_token: string; whatsapp_phone_number_id: string; whatsapp_business_account_id?: string }
+) {
+  const res = await pool.query(`
+    UPDATE empresas SET
+      whatsapp_token = $2,
+      whatsapp_phone_number_id = $3,
+      whatsapp_business_account_id = $4
+    WHERE id = $1
+    RETURNING *
+  `, [
+    empresa_id,
+    data.whatsapp_token,
+    data.whatsapp_phone_number_id,
+    data.whatsapp_business_account_id ?? null,
+  ]);
   return res.rows[0] ?? null;
 }
 

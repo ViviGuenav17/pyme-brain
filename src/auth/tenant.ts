@@ -6,6 +6,7 @@ import { DriveAdapter } from '../adapters/drive.adapter.js';
 import { CalendarAdapter } from '../adapters/calendar.adapter.js';
 import { TasksAdapter } from '../adapters/tasks.adapter.js';
 import { DocsAdapter } from '../adapters/docs.adapter.js';
+import { WhatsAppAdapter } from '../adapters/whatsapp.adapter.js';
 import { logger } from '../utils/logger.js';
 
 export interface TenantAdapters {
@@ -15,6 +16,7 @@ export interface TenantAdapters {
   calendar: CalendarAdapter;
   tasks: TasksAdapter;
   docs: DocsAdapter;
+  whatsapp: WhatsAppAdapter;
   empresa_id: string;
   empresa_nombre: string;
 }
@@ -55,11 +57,21 @@ export async function getAdaptersForEmpresa(empresa_id: string): Promise<TenantA
   const tasks = new TasksAdapter(auth);
   const docs = new DocsAdapter(auth);
 
+  // WhatsApp — si la empresa tiene credenciales propias las usa, si no,
+  // el adapter cae solo al fallback de .env (número de prueba demo)
+  const whatsapp = empresa.whatsapp_token && empresa.whatsapp_phone_number_id
+    ? new WhatsAppAdapter({
+        token: empresa.whatsapp_token,
+        phoneNumberId: empresa.whatsapp_phone_number_id,
+        businessAccountId: empresa.whatsapp_business_account_id ?? undefined,
+      })
+    : new WhatsAppAdapter(); // fallback .env — modo demo
+
   // Inicializar sheets con la config de la empresa
   await sheets.initialize();
 
   const adapters: TenantAdapters = {
-    sheets, gmail, drive, calendar, tasks, docs,
+    sheets, gmail, drive, calendar, tasks, docs, whatsapp,
     empresa_id,
     empresa_nombre: empresa.nombre,
   };
@@ -68,7 +80,11 @@ export async function getAdaptersForEmpresa(empresa_id: string): Promise<TenantA
   tenantCache.set(empresa_id, adapters);
 
   logger.info('Adapters cargados para empresa', {
-    data: { empresa_id, nombre: empresa.nombre }
+    data: {
+      empresa_id,
+      nombre: empresa.nombre,
+      whatsapp_configurado: whatsapp.isConfigured(),
+    }
   });
 
   return adapters;
