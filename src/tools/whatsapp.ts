@@ -6,12 +6,18 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { WhatsAppAdapter } from '../adapters/whatsapp.adapter.js';
 import { SheetsAdapter } from '../adapters/sheets.adapter.js';
+import { WhatsappSheetAdapter } from '../adapters/whatsapp-sheet.adapter.js';
 import { measureTool } from '../utils/metrics.js';
 import { logger } from '../utils/logger.js';
 import { idempotencyStore } from '../infra/idempotency.js';
 import { randomUUID } from 'crypto';
 
-export function registerWhatsappTools(server: McpServer, whatsapp: WhatsAppAdapter, sheets: SheetsAdapter) {
+export function registerWhatsappTools(
+  server: McpServer,
+  whatsapp: WhatsAppAdapter,
+  sheets: SheetsAdapter,
+  whatsappSheet: WhatsappSheetAdapter
+) {
 
   // Helper interno — todas las tools de acción comparten esta verificación
   function notConfiguredResponse() {
@@ -24,6 +30,50 @@ export function registerWhatsappTools(server: McpServer, whatsapp: WhatsAppAdapt
         }),
       }],
     };
+  }
+
+  // Helper compartido — combina contactos del webhook en vivo con el Sheet
+  // dedicado de WhatsApp (Contactos_WhatsApp) cuando el buffer está vacío.
+  // Usado por get_unread_whatsapp y get_whatsapp_contacts para que la demo
+  // se vea poblada con un CRM real, incluso si el servidor se reinició.
+  async function getContactosConFallback(): Promise<{
+    contactos: Array<{ telefono: string; ultimo_mensaje?: string; ultimo_mensaje_fecha?: string; no_leidos: number; nombre?: string; sucursal?: string; vendedor_asignado?: string; etiqueta?: string }>;
+    fuente: 'webhook_en_vivo' | 'datos_demo';
+  }> {
+    const enVivo = await whatsapp.getRecentContacts();
+    if (enVivo.length > 0) {
+      return { contactos: enVivo, fuente: 'webhook_en_vivo' };
+    }
+
+    const [contactosDemo, mensajesDemo] = await Promise.all([
+      whatsappSheet.getContactos(),
+      whatsappSheet.getMensajes(),
+    ]);
+
+    if (contactosDemo.length === 0) {
+      return { contactos: [], fuente: 'webhook_en_vivo' };
+    }
+
+    // Enriquecer cada contacto con su último mensaje inbound desde la
+    // pestaña Mensajes_WhatsApp.
+    const contactos = contactosDemo.map(c => {
+      const mensajesDelContacto = mensajesDemo
+        .filter(m => m.telefono === c.telefono && m.direccion === 'inbound')
+        .sort((a, b) => new Date(b.fecha).getTime() - new Date(a.fecha).getTime());
+
+      return {
+        telefono: c.telefono,
+        nombre: c.nombre,
+        sucursal: c.sucursal,
+        vendedor_asignado: c.vendedor_asignado,
+        etiqueta: c.etiqueta,
+        ultimo_mensaje: mensajesDelContacto[0]?.mensaje,
+        ultimo_mensaje_fecha: mensajesDelContacto[0]?.fecha ?? c.ultima_actividad,
+        no_leidos: mensajesDelContacto.length,
+      };
+    }).sort((a, b) => new Date(b.ultimo_mensaje_fecha ?? 0).getTime() - new Date(a.ultimo_mensaje_fecha ?? 0).getTime());
+
+    return { contactos, fuente: 'datos_demo' };
   }
 
   server.tool(
@@ -290,10 +340,40 @@ export function registerWhatsappTools(server: McpServer, whatsapp: WhatsAppAdapt
       logger.info('get_whatsapp_history iniciado', { correlationId, tool: 'get_whatsapp_history', data: { phone } });
 
       return measureTool('get_whatsapp_history', async () => {
-        const mensajes = await whatsapp.getConversationHistory(phone, limit);
+        let mensajes = await whatsapp.getConversationHistory(phone, limit);
+        let fuente = 'webhook_en_vivo';
+        let sucursal: string | undefined;
+
+        // Fallback al Sheet dedicado de WhatsApp si el webhook aún no
+        // registró nada para este número (servidor recién reiniciado, o
+        // número que solo existe en los datos de ejemplo de la demo).
+        if (mensajes.length === 0) {
+          const phoneNorm = phone.replace(/[^0-9]/g, '').replace(/^591/, '');
+          const demo = await whatsappSheet.getMensajes();
+          const delContacto = demo.filter(m => m.telefono.replace(/^591/, '') === phoneNorm);
+
+          if (delContacto.length > 0) {
+            fuente = 'datos_demo';
+            sucursal = delContacto[0]?.sucursal;
+            mensajes = delContacto
+              .sort((a, b) => new Date(a.fecha).getTime() - new Date(b.fecha).getTime())
+              .slice(-limit)
+              .map(m => ({
+                id: m.id,
+                from: m.direccion === 'inbound' ? m.telefono : 'empresa',
+                to: m.direccion === 'inbound' ? 'empresa' : m.telefono,
+                body: m.mensaje,
+                type: m.tipo as any,
+                timestamp: m.fecha,
+                direction: m.direccion,
+              }));
+          }
+        }
 
         const result = {
           telefono: phone,
+          sucursal,
+          fuente,
           total_mensajes: mensajes.length,
           mensajes: mensajes.map(m => ({
             id: m.id,
@@ -308,7 +388,7 @@ export function registerWhatsappTools(server: McpServer, whatsapp: WhatsAppAdapt
         };
 
         logger.info('get_whatsapp_history completado', {
-          correlationId, tool: 'get_whatsapp_history', data: { phone, total: mensajes.length },
+          correlationId, tool: 'get_whatsapp_history', data: { phone, total: mensajes.length, fuente },
         });
 
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
@@ -333,9 +413,10 @@ export function registerWhatsappTools(server: McpServer, whatsapp: WhatsAppAdapt
       logger.info('get_unread_whatsapp iniciado', { correlationId, tool: 'get_unread_whatsapp' });
 
       return measureTool('get_unread_whatsapp', async () => {
-        const contactos = await whatsapp.getRecentContacts();
+        const { contactos, fuente } = await getContactosConFallback();
 
         const result = {
+          fuente,
           total_contactos: contactos.length,
           contactos: contactos.map(c => ({
             telefono: c.telefono,
@@ -349,7 +430,7 @@ export function registerWhatsappTools(server: McpServer, whatsapp: WhatsAppAdapt
         };
 
         logger.info('get_unread_whatsapp completado', {
-          correlationId, tool: 'get_unread_whatsapp', data: { total: contactos.length },
+          correlationId, tool: 'get_unread_whatsapp', data: { total: contactos.length, fuente },
         });
 
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
@@ -466,8 +547,8 @@ export function registerWhatsappTools(server: McpServer, whatsapp: WhatsAppAdapt
       logger.info('get_whatsapp_contacts iniciado', { correlationId, tool: 'get_whatsapp_contacts' });
 
       return measureTool('get_whatsapp_contacts', async () => {
-        const [contactosWhatsapp, clientes, leads] = await Promise.all([
-          whatsapp.getRecentContacts(),
+        const [{ contactos: contactosWhatsapp, fuente }, clientes, leads] = await Promise.all([
+          getContactosConFallback(),
           sheets.getClientes(),
           sheets.getLeads(),
         ]);
@@ -514,6 +595,7 @@ export function registerWhatsappTools(server: McpServer, whatsapp: WhatsAppAdapt
         }
 
         const result = {
+          fuente,
           total_contactos: contactosWhatsapp.length,
           identificados: {
             total: identificados.length,
@@ -632,6 +714,51 @@ export function registerWhatsappTools(server: McpServer, whatsapp: WhatsAppAdapt
 
         logger.info('send_whatsapp_price_list completado', {
           correlationId, tool: 'send_whatsapp_price_list', data: { to, total: disponibles.length, status: result.status },
+        });
+
+        return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+      });
+    }
+  );
+
+  server.tool(
+    'get_whatsapp_templates',
+    `Lista las plantillas de WhatsApp pre-aprobadas por Meta disponibles para enviar.
+    
+    CUÁNDO USAR: El dueño pregunta "¿qué plantillas tengo aprobadas?",
+    "¿puedo mandar un recordatorio de cobro por plantilla?", "¿qué mensajes automáticos tengo configurados?".
+    Útil antes de usar send_whatsapp_template, para saber el nombre exacto y las variables que pide.
+    
+    DEVUELVE: Plantillas con su estado de aprobación, categoría y variables requeridas.`,
+    {
+      solo_aprobadas: z.boolean().default(true).describe('Si true, solo muestra plantillas con estado APROBADA. Default: true'),
+    },
+    async ({ solo_aprobadas }) => {
+      const correlationId = randomUUID();
+      logger.info('get_whatsapp_templates iniciado', { correlationId, tool: 'get_whatsapp_templates' });
+
+      return measureTool('get_whatsapp_templates', async () => {
+        const plantillas = await whatsappSheet.getPlantillas();
+        const filtradas = solo_aprobadas ? plantillas.filter(p => p.estado === 'APROBADA') : plantillas;
+
+        const result = {
+          total: filtradas.length,
+          plantillas: filtradas.map(p => ({
+            nombre: p.nombre,
+            categoria: p.categoria,
+            idioma: p.idioma,
+            estado: p.estado,
+            texto: p.texto,
+            variables_requeridas: p.variables,
+            fecha_aprobacion: p.fecha_aprobacion,
+          })),
+          nota: filtradas.length === 0
+            ? '📋 No hay plantillas registradas en el Sheet de WhatsApp.'
+            : `Usa send_whatsapp_template con template_name="${filtradas[0]?.nombre}" y parameters en el mismo orden que: ${filtradas[0]?.variables.join(', ')}`,
+        };
+
+        logger.info('get_whatsapp_templates completado', {
+          correlationId, tool: 'get_whatsapp_templates', data: { total: filtradas.length },
         });
 
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };

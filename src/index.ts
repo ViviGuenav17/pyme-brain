@@ -13,6 +13,7 @@ import { CalendarAdapter } from "./adapters/calendar.adapter.js";
 import { TasksAdapter } from "./adapters/tasks.adapter.js";
 import { DocsAdapter } from "./adapters/docs.adapter.js";
 import { WhatsAppAdapter } from "./adapters/whatsapp.adapter.js";
+import { WhatsappSheetAdapter } from "./adapters/whatsapp-sheet.adapter.js";
 import { registerBITools } from "./tools/bi.js";
 import { registerCobrosTools } from "./tools/cobros.js";
 import { registerInventarioTools } from "./tools/inventario.js";
@@ -21,9 +22,9 @@ import { registerGoogleTools } from "./tools/google.js";
 import { registerFacturacionTools } from "./tools/facturacion.js";
 import { registerWhatsappTools } from "./tools/whatsapp.js";
 import { logger } from "./utils/logger.js";
-import { initDB, upsertEmpresa } from "./auth/db.js";
+import { initDB, upsertEmpresa, updateEmpresaWhatsapp } from "./auth/db.js";
 import { getAuthUrl, exchangeCodeForTokens, getUserInfo } from "./auth/oauth.js";
-import { getAdaptersForEmpresa } from "./auth/tenant.js";
+import { getAdaptersForEmpresa, invalidateTenantCache } from "./auth/tenant.js";
 import { handleWhatsAppWebhookVerify, handleWhatsAppWebhookEvent } from "./webhooks/whatsapp-webhook.handler.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,7 +36,8 @@ const drive = new DriveAdapter();
 const calendar = new CalendarAdapter();
 const tasks = new TasksAdapter();
 const docs = new DocsAdapter();
-const whatsapp = new WhatsAppAdapter(); // fallback a .env — número de prueba demo
+const whatsapp = new WhatsAppAdapter(); // fallback a .env — número de prueba demo, sin empresa_id fija
+const whatsappSheet = new WhatsappSheetAdapter(); // Sheet separado de Mensajes/Contactos/Plantillas WhatsApp
 
 const sessions = new Map<string, { server: McpServer; transport: StreamableHTTPServerTransport }>();
 
@@ -154,6 +156,57 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Vincular WhatsApp a una empresa manualmente (temporal, mientras no ──
+  // ── existe el flujo OAuth completo de Meta — Solución B simplificada) ──
+  // POST body JSON, NO query params — evita exponer el token en la URL/logs.
+  if (url === '/auth/whatsapp/manual' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', async () => {
+      try {
+        const data = JSON.parse(body || '{}');
+        const { empresa_id, whatsapp_token, whatsapp_phone_number_id, whatsapp_business_account_id } = data;
+
+        if (!empresa_id || !whatsapp_token || !whatsapp_phone_number_id) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Faltan campos: empresa_id, whatsapp_token, whatsapp_phone_number_id' }));
+          return;
+        }
+
+        const empresa = await updateEmpresaWhatsapp(empresa_id, {
+          whatsapp_token,
+          whatsapp_phone_number_id,
+          whatsapp_business_account_id,
+        });
+
+        if (!empresa) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Empresa ${empresa_id} no encontrada` }));
+          return;
+        }
+
+        logger.info('WhatsApp vinculado manualmente a empresa', {
+          data: { empresa_id, nombre: empresa.nombre }
+        });
+
+        invalidateTenantCache(empresa_id);
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          status: 'OK',
+          empresa_id: empresa.id,
+          nombre: empresa.nombre,
+          whatsapp_phone_number_id: empresa.whatsapp_phone_number_id,
+        }));
+      } catch (err) {
+        logger.error('Error vinculando WhatsApp manual', { error: String(err) });
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: String(err) }));
+      }
+    });
+    return;
+  }
+
   // ── Webhook de WhatsApp — verificación (Meta llama esto una sola vez) ──
   if (url.startsWith('/webhooks/whatsapp') && req.method === 'GET') {
     handleWhatsAppWebhookVerify(req, res);
@@ -232,7 +285,7 @@ const httpServer = http.createServer(async (req, res) => {
       registerVentasTools(server, activeSheets);
       registerGoogleTools(server, activeGmail, activeDrive, activeCalendar, activeTasks, activeDocs);
       registerFacturacionTools(server, sheets);
-      registerWhatsappTools(server, activeWhatsapp, activeSheets);
+      registerWhatsappTools(server, activeWhatsapp, activeSheets, whatsappSheet);
 
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => sessionId,
