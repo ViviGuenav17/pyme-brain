@@ -39,6 +39,12 @@ const docs = new DocsAdapter();
 const whatsapp = new WhatsAppAdapter(); // fallback a .env — número de prueba demo, sin empresa_id fija
 const whatsappSheet = new WhatsappSheetAdapter(); // Sheet separado de Mensajes/Contactos/Plantillas WhatsApp
 
+// ── Estado de salud del tenant demo (Sheet/Google) ──────────────────
+// Si el refresh token demo vence (invalid_grant) o el Sheet falla al
+// arrancar, el servidor NO debe morir: sigue sirviendo HTTP (onboarding,
+// health, OAuth callback, multi-tenant) en modo degradado para ese tenant.
+let demoSheetsStatus: { ok: boolean; error?: string } = { ok: false, error: 'No inicializado aún' };
+
 const sessions = new Map<string, { server: McpServer; transport: StreamableHTTPServerTransport }>();
 
 function parseQuery(url: string): Record<string, string> {
@@ -120,6 +126,10 @@ const httpServer = http.createServer(async (req, res) => {
       logger.info('Empresa conectada via OAuth', {
         data: { email: userInfo.email, empresa_id: empresa.id }
       });
+
+      // Si esta empresa reconectada es el tenant demo, invalidamos su
+      // cache de adapters para que tome el refresh_token nuevo de inmediato.
+      invalidateTenantCache(empresa.id);
 
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(`<!DOCTYPE html>
@@ -221,10 +231,10 @@ const httpServer = http.createServer(async (req, res) => {
 
   // ── Health check ──────────────────────────────────────────────────
   if (url === '/health' && req.method === 'GET') {
-    const empresaConfig = sheets.getEmpresaConfig();
+    const empresaConfig = demoSheetsStatus.ok ? sheets.getEmpresaConfig() : undefined;
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
-      status: 'OK',
+      status: demoSheetsStatus.ok ? 'OK' : 'DEGRADED',
       timestamp: new Date().toISOString(),
       version: '1.0.0',
       empresa: empresaConfig?.nombre_empresa ?? 'Cargando...',
@@ -232,7 +242,8 @@ const httpServer = http.createServer(async (req, res) => {
       moneda: empresaConfig?.moneda ?? 'BOB',
       uptime: process.uptime(),
       integraciones: {
-        sheets: '✅', gmail: '✅', drive: '✅',
+        sheets: demoSheetsStatus.ok ? '✅' : `⚠️ ${demoSheetsStatus.error ?? 'no disponible'}`,
+        gmail: '✅', drive: '✅',
         calendar: '✅', tasks: '✅', docs: '✅',
         database: '✅',
         whatsapp: whatsapp.isConfigured() ? '✅' : '⚠️ no configurado',
@@ -277,6 +288,12 @@ const httpServer = http.createServer(async (req, res) => {
             data: { empresaId, error: String(err) }
           });
         }
+      } else if (!demoSheetsStatus.ok) {
+        // No vino empresa_id Y el tenant demo está degradado (token vencido, etc).
+        // Avisamos explícitamente en vez de dejar que las tools fallen en silencio.
+        logger.warn('Sesión MCP demo solicitada pero el Sheet demo está degradado', {
+          data: { sessionId, error: demoSheetsStatus.error }
+        });
       }
 
       registerBITools(server, activeSheets);
@@ -314,12 +331,28 @@ async function main() {
   await initDB();
   logger.info('Base de datos PostgreSQL inicializada');
 
-  await sheets.initialize();
-  const config = sheets.getEmpresaConfig();
+  // ── Graceful Degradation ────────────────────────────────────────
+  // Si el refresh token del tenant demo venció (invalid_grant) o el Sheet
+  // falla por cualquier motivo, NO matamos el proceso. El servidor sigue
+  // arrancando y sirviendo HTTP (onboarding, OAuth, multi-tenant, health),
+  // solo el tenant demo queda marcado como degradado hasta que alguien
+  // reconecte Google desde "/".
+  try {
+    await sheets.initialize();
+    demoSheetsStatus = { ok: true };
+    logger.info('Sheet demo inicializado correctamente');
+  } catch (err) {
+    demoSheetsStatus = { ok: false, error: String(err) };
+    logger.error('Sheet demo no disponible al iniciar — continuando en modo degradado', {
+      error: String(err)
+    });
+  }
+
+  const config = demoSheetsStatus.ok ? sheets.getEmpresaConfig() : undefined;
 
   httpServer.listen(PORT, () => {
-    logger.info('PyME Brain iniciado', { data: { port: PORT } });
-    console.log(`✅ PyME Brain MCP Server — ${config?.nombre_empresa}`);
+    logger.info('PyME Brain iniciado', { data: { port: PORT, demoSheets: demoSheetsStatus.ok } });
+    console.log(`✅ PyME Brain MCP Server — ${config?.nombre_empresa ?? '(tenant demo degradado)'}`);
     console.log(`   Health:   http://localhost:${PORT}/health`);
     console.log(`   MCP:      http://localhost:${PORT}/mcp`);
     console.log(`   Web:      http://localhost:${PORT}/`);
@@ -328,6 +361,9 @@ async function main() {
 }
 
 main().catch(err => {
-  logger.error('Error al iniciar', { error: String(err) });
+  // Esto solo debería dispararse ante errores realmente fatales
+  // (ej: initDB() falla porque DATABASE_URL está mal, o el puerto
+  // ya está en uso) — no ante fallos de un adaptador individual.
+  logger.error('Error fatal al iniciar', { error: String(err) });
   process.exit(1);
 });

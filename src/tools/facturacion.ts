@@ -1,7 +1,6 @@
 // Dominio: Facturación Bolivia
 // Simulación inteligente del SIN/SIAT boliviano
 // Incluye facturas electrónicas, recibos y cálculo de márgenes reales
-// Replica las 14 tools de CUCU Bolivia + tools adicionales de PyME Brain
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
@@ -12,9 +11,9 @@ import { idempotencyStore } from '../infra/idempotency.js';
 import { randomUUID } from 'crypto';
 
 // Constantes fiscales Bolivia
-const IT_PORCENTAJE = 3; // Impuesto a las Transacciones 3%
-const IVA_PORCENTAJE = 13; // IVA incluido en precio de venta
-const COSTO_FACTURA_BOB = 0.88; // Costo por factura (referencia CUCU)
+const IT_PORCENTAJE = 3; 
+const IVA_PORCENTAJE = 13; 
+const COSTO_FACTURA_BOB = 0.88; 
 
 // Catálogo de tipos de documento SIN Bolivia
 const TIPOS_DOCUMENTO = {
